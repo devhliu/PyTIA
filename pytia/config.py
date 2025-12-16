@@ -93,4 +93,21 @@ def default_config() -> dict[str, Any]:
                 "reference_time": "peak",  # peak | last | index:<int>
             },
         },
+        "single_time": {
+            # Single-timepoint TIA calculation (when T=1 image provided)
+            # Computes TIA = A(t) / λ_eff using one of three methods:
+            "enabled": False,
+            # Method: phys (physical decay) | haenscheid (effective HL) | prior_half_life (segmentation prior)
+            "method": "phys",
+            # For haenscheid method: effective half-life in human body (seconds)
+            # If None, falls back to physics.half_life_seconds
+            "haenscheid_eff_half_life_seconds": None,
+            # For prior_half_life method: global half-life (seconds) or default for unmapped labels
+            "half_life_seconds": None,
+            # For prior_half_life method with label-map: path to label/segmentation image (NIfTI)
+            "label_map_path": None,
+            # For prior_half_life method with label-map: dict mapping label (int) -> half_life (seconds)
+            # Example: {1: 1800.0, 2: 3600.0, 3: 5400.0}
+            "label_half_lives": {},
+        },
     }

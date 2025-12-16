@@ -74,6 +74,44 @@ def run_tia(
     config: str | Path | dict[str, Any] | None = None,
     mask: str | Path | Any | None = None,
 ) -> Results:
+    """
+    Compute time-integrated activity (TIA) from activity images.
+
+    Supports both multi-timepoint (dynamic) and single-timepoint (static) modes:
+    
+    **Multi-timepoint mode** (T ≥ 2):
+        - Fits exponential/gamma models to activity time-curves
+        - Computes TIA via curve fitting and numerical integration
+        - Supports 3 curve classes: rising, hump (gamma), falling (exponential)
+        - Optionally applies physical decay tail extrapolation
+        
+    **Single-timepoint mode** (T = 1, `single_time.enabled=True`):
+        Computes TIA = A(t) / λ_eff using one of three methods:
+        
+        1. **phys** (physical decay):
+           Uses physical decay rate from radionuclide half-life.
+           λ = ln(2) / half_life (from `physics.half_life_seconds`)
+           
+        2. **haenscheid** (Hänscheid method):
+           Uses effective half-life of tracer in human body.
+           λ = ln(2) / eff_half_life (from `single_time.haenscheid_eff_half_life_seconds`,
+           falls back to `physics.half_life_seconds`)
+           
+        3. **prior_half_life** (prior segmentation-based):
+           Supports global or label-map based half-life priors.
+           - Global: λ = ln(2) / half_life (from `single_time.half_life_seconds`)
+           - Label-based: λ per voxel from `single_time.label_half_lives` mapping,
+             keyed by label from `single_time.label_map_path`
+    
+    Args:
+        images: Single image or sequence of images (NIfTI paths or nibabel objects)
+        times: Timepoints in specified unit (one per image)
+        config: Config dict, YAML path, or None (uses defaults)
+        mask: Optional mask image (path or nibabel object)
+        
+    Returns:
+        Results object with TIA, R², sigma_TIA, model_id, status_id images and summary
+    """
     import time as _time
 
     t0_all = _time.perf_counter()
@@ -144,6 +182,169 @@ def run_tia(
     model_id = np.zeros((n_vox,), dtype=np.uint8)
     status_id = np.full((n_vox,), STATUS_OK, dtype=np.uint8)
     tpeak = np.full((n_vox,), np.nan, dtype=np.float32)
+
+    # Single-timepoint (STP) handling
+    # When single image is provided with STP enabled, compute TIA = A(t) / λ_eff
+    # using one of three methods: phys (physical), haenscheid (effective), or prior_half_life (segmentation-prior)
+    st_cfg = cfg.get("single_time", {})
+    if T == 1 and bool(st_cfg.get("enabled", False)):
+        t0 = _time.perf_counter()
+        method = (st_cfg.get("method", "phys") or "phys").lower()
+
+        # Extract activity values for masked voxels (shape: n_vox,)
+        Aflat = A4.reshape((-1, T))[idx, 0].astype(np.float32)
+
+        # Apply noise-floor filtering (same as multi-timepoint)
+        nf_cfg = cfg["noise_floor"]
+        if nf_cfg["enabled"]:
+            floor = compute_noise_floor(
+                Aflat[:, None],
+                mode=nf_cfg["mode"],
+                absolute=float(nf_cfg["absolute_bq_per_ml"] * vml),
+                rel_frac=float(nf_cfg["relative_fraction_of_voxel_max"]),
+            )
+            valid = valid_mask_from_floor(Aflat[:, None], floor)[:, 0]
+        else:
+            valid = np.isfinite(Aflat)
+
+        all_below = ~valid
+        status_id[all_below] = STATUS_ALL_BELOW_FLOOR
+
+        # Determine effective decay rate (λ_eff) per voxel according to method
+        # Will compute TIA = A / λ_eff for each voxel
+        lambda_eff = np.full((n_vox,), np.nan, dtype=np.float32)
+
+        if method == "phys":
+            # Method 1: Physical decay using radionuclide half-life
+            if lambda_phys is None:
+                status_id[~all_below] = STATUS_FIT_FAILED
+            else:
+                lambda_eff[:] = float(lambda_phys)
+                model_code = 101
+
+        elif method == "haenscheid" or method == "hanscheid":
+            # Method 2: Hänscheid method using effective half-life in human body
+            # Falls back to physics.half_life_seconds if explicit effective HL not provided
+            eff_hl = st_cfg.get("haenscheid_eff_half_life_seconds") or cfg["physics"].get("half_life_seconds")
+            if eff_hl is None:
+                status_id[~all_below] = STATUS_FIT_FAILED
+            else:
+                lambda_eff[:] = float(np.log(2.0) / float(eff_hl))
+                model_code = 102
+
+        elif method == "prior_half_life" or method == "prior":
+            # Method 3: Prior segmentation-based half-lives
+            # Supports both global and label-map based mapping
+            if st_cfg.get("label_map_path"):
+                # Label-map mode: map voxel label -> half-life value
+                lab_img = load_mask(st_cfg["label_map_path"])
+                labs = np.asanyarray(lab_img.dataobj).reshape(-1)[idx].astype(np.int32)
+                mapping = {int(k): float(v) for k, v in (st_cfg.get("label_half_lives") or {}).items()}
+                default_hl = st_cfg.get("half_life_seconds")
+                for i, lab in enumerate(labs):
+                    hl_val = mapping.get(int(lab), default_hl)
+                    if hl_val is None:
+                        lambda_eff[i] = np.nan
+                    else:
+                        lambda_eff[i] = float(np.log(2.0) / float(hl_val))
+                model_code = 103
+            else:
+                # Global mode: same half-life for all voxels
+                hl_val = st_cfg.get("half_life_seconds")
+                if hl_val is None:
+                    status_id[~all_below] = STATUS_FIT_FAILED
+                else:
+                    lambda_eff[:] = float(np.log(2.0) / float(hl_val))
+                    model_code = 103
+        else:
+            status_id[~all_below] = STATUS_FIT_FAILED
+
+        # Compute TIA = A(t) / λ_eff where activity is valid and λ_eff is positive and finite
+        ok = valid & np.isfinite(lambda_eff) & (lambda_eff > 0)
+        tia_vals = np.full((n_vox,), np.nan, dtype=np.float32)
+        tia_vals[ok] = (Aflat[ok] / lambda_eff[ok]).astype(np.float32)
+
+        tia[:] = tia_vals
+        model_id[ok] = np.uint8(model_code if "model_code" in locals() else 0)
+        # mark invalid voxels
+        bad = ~ok & ~all_below
+        status_id[bad] = STATUS_NOT_APPLICABLE_INSUFFICIENT_POINTS
+
+        timing_ms["single_time_ms"] = 1000.0 * (_time.perf_counter() - t0)
+
+        # Unflatten to volumes and save (reuse same behaviour as multi-timepoint)
+        t0 = _time.perf_counter()
+        shape3 = ref.shape[:3]
+        tia_vol = np.full((np.prod(shape3),), np.nan, dtype=np.float32)
+        r2_vol = np.full_like(tia_vol, np.nan)
+        sig_vol = np.full_like(tia_vol, np.nan)
+        model_vol = np.zeros_like(tia_vol, dtype=np.uint8)
+        status_vol = np.zeros_like(tia_vol, dtype=np.uint8)
+        tpeak_vol = np.full_like(tia_vol, np.nan)
+
+        status_vol[:] = STATUS_OUTSIDE
+        tia_vol[idx] = tia
+        r2_vol[idx] = r2
+        sig_vol[idx] = sigma_tia
+        model_vol[idx] = model_id
+        status_vol[idx] = status_id
+        tpeak_vol[idx] = tpeak
+
+        tia_img = make_like(ref, tia_vol.reshape(shape3))
+        r2_img = make_like(ref, r2_vol.reshape(shape3))
+        sig_img = make_like(ref, sig_vol.reshape(shape3))
+        model_img = make_like(ref, model_vol.reshape(shape3).astype(np.uint8))
+        status_img = make_like(ref, status_vol.reshape(shape3).astype(np.uint8))
+        tpeak_img = None
+        timing_ms["assemble_ms"] = 1000.0 * (_time.perf_counter() - t0)
+
+        # Save outputs
+        t0 = _time.perf_counter()
+        outputs: dict[str, Path] = {}
+        import nibabel as nib  # local import
+
+        fn_tia = _out_name(prefix, "tia.nii.gz")
+        fn_r2 = _out_name(prefix, "r2.nii.gz")
+        fn_sig = _out_name(prefix, "sigma_tia.nii.gz")
+        fn_model = _out_name(prefix, "model_id.nii.gz")
+        fn_status = _out_name(prefix, "status_id.nii.gz")
+
+        nib.save(tia_img, str(out_dir / fn_tia)); outputs["tia"] = out_dir / fn_tia
+        nib.save(r2_img, str(out_dir / fn_r2)); outputs["r2"] = out_dir / fn_r2
+        nib.save(sig_img, str(out_dir / fn_sig)); outputs["sigma_tia"] = out_dir / fn_sig
+        nib.save(model_img, str(out_dir / fn_model)); outputs["model_id"] = out_dir / fn_model
+        nib.save(status_img, str(out_dir / fn_status)); outputs["status_id"] = out_dir / fn_status
+        timing_ms["save_ms"] = 1000.0 * (_time.perf_counter() - t0)
+
+        # Summary and return
+        status_counts = {int(k): int(v) for k, v in zip(*np.unique(status_vol[idx], return_counts=True))}
+        summary = {
+            "pytia_version": "0.1.0",
+            "times_seconds": [float(x) for x in t_s.tolist()],
+            "voxel_volume_ml": float(vml),
+            "status_legend": STATUS_LEGEND,
+            "status_counts": {STATUS_LEGEND[int(k)]: int(v) for k, v in status_counts.items()},
+            "timing_ms": timing_ms,
+            "config": cfg,
+        }
+        if io_cfg.get("write_summary_yaml", True):
+            outputs["summary"] = _save_summary(out_dir, prefix, summary)
+
+        timing_ms["total_ms"] = 1000.0 * (_time.perf_counter() - t0_all)
+        summary["timing_ms"] = timing_ms
+
+        return Results(
+            tia_img=tia_img,
+            r2_img=r2_img,
+            sigma_tia_img=sig_img,
+            model_id_img=model_img,
+            status_id_img=status_img,
+            tpeak_img=tpeak_img,
+            summary=summary,
+            output_paths=outputs,
+            config=cfg,
+            times_s=t_s.astype(np.float64),
+        )
 
     # Regions mode?
     reg_cfg = cfg["regions"]

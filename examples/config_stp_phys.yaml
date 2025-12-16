@@ -1,0 +1,56 @@
+################################################################################
+# PyTIA Configuration: Single-Timepoint TIA (Physical Decay)
+#
+# Compute TIA from a single activity map using physical decay.
+# Formula: TIA = A(t) / λ,  where λ = ln(2) / half_life
+#
+# Usage:
+#   pytia run --config config_stp_phys.yaml
+################################################################################
+
+inputs:
+  images:
+    - activity.nii.gz
+  times:
+    - 0.0
+  mask: null
+
+io:
+  output_dir: ./output/stp_phys
+  prefix: stp_phys
+
+time:
+  unit: seconds
+
+physics:
+  # Physical half-life of radionuclide (seconds)
+  # Tc-99m: 21600 s (6 h)
+  # F-18: 6600 s (110 min)
+  half_life_seconds: 21600.0
+
+mask:
+  mode: otsu
+  min_fraction_of_max: 0.02
+
+denoise:
+  enabled: true
+  sigma_vox: 1.2
+
+noise_floor:
+  enabled: true
+  mode: relative
+  relative_fraction_of_voxel_max: 0.01
+
+bootstrap:
+  enabled: false
+
+performance:
+  chunk_size_vox: 500000
+
+regions:
+  enabled: false
+
+# Single-timepoint configuration - Physical Decay method
+single_time:
+  enabled: true
+  method: phys  # Physical decay method

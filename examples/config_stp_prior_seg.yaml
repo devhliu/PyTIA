@@ -1,0 +1,69 @@
+################################################################################
+# PyTIA Configuration: Single-Timepoint TIA (Segmentation-Based Priors)
+#
+# Compute voxel-wise TIA using organ/lesion-specific half-lives from segmentation.
+# Formula: TIA_v = A_v / λ_L,  where L = label(v)
+#
+# Usage:
+#   pytia run --config config_stp_prior_seg.yaml
+################################################################################
+
+inputs:
+  images:
+    - activity.nii.gz
+  times:
+    - 0.0
+  # Optional: segmentation mask (if different from activity mask)
+  mask: null
+
+io:
+  output_dir: ./output/stp_prior_seg
+  prefix: stp_prior_seg
+
+time:
+  unit: seconds
+
+physics:
+  half_life_seconds: 3600.0  # Physical (not used in prior_half_life method)
+
+mask:
+  mode: otsu
+  min_fraction_of_max: 0.02
+
+denoise:
+  enabled: true
+  sigma_vox: 1.2
+
+noise_floor:
+  enabled: true
+  mode: relative
+  relative_fraction_of_voxel_max: 0.01
+
+bootstrap:
+  enabled: false
+
+performance:
+  chunk_size_vox: 500000
+
+regions:
+  enabled: false
+
+# Single-timepoint configuration - Prior Half-Life (Segmentation) method
+single_time:
+  enabled: true
+  method: prior_half_life
+  
+  # Path to segmentation/label image (NIfTI format)
+  # Each voxel label maps to a half-life value
+  label_map_path: segmentation.nii.gz
+  
+  # Mapping from label value to half-life (in seconds)
+  # Format: {label_int: half_life_seconds}
+  label_half_lives:
+    1: 1800.0   # Label 1 (e.g., tumor): 30 minutes
+    2: 3600.0   # Label 2 (e.g., liver): 60 minutes
+    3: 5400.0   # Label 3 (e.g., kidney): 90 minutes
+    4: 7200.0   # Label 4 (e.g., spleen): 120 minutes
+  
+  # Default half-life for labels not in the mapping above (optional)
+  half_life_seconds: 3600.0

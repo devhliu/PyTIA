@@ -1,0 +1,108 @@
+################################################################################
+# PyTIA Configuration: Multi-Timepoint TIA Calculation
+#
+# This configuration file demonstrates how to set up PyTIA for computing
+# time-integrated activity (TIA) maps from multiple time-point PET/SPECT images.
+#
+# Usage:
+#   pytia run --config config_multitime.yaml
+################################################################################
+
+# Input and output configuration
+inputs:
+  # List of activity images (paths to NIfTI files)
+  images:
+    - activity_t0.nii.gz
+    - activity_t1.nii.gz
+    - activity_t2.nii.gz
+    - activity_t3.nii.gz
+  
+  # Timepoints corresponding to each image (in specified unit)
+  times:
+    - 0.0      # baseline
+    - 30.0     # 30 seconds
+    - 60.0     # 60 seconds
+    - 120.0    # 120 seconds
+  
+  # Optional: mask image (if not provided, will be auto-generated)
+  mask: null
+
+io:
+  output_dir: ./output/multitime
+  prefix: multitime_result
+  save_intermediate: false
+  write_summary_yaml: true
+
+# Time configuration
+time:
+  unit: seconds        # options: seconds, hours
+  sort_timepoints: true
+
+# Radioactive decay physics
+physics:
+  # Half-life of the radionuclide (in seconds)
+  # Examples:
+  #   Tc-99m: 21600 s (6 hours)
+  #   F-18:   6600 s (110 minutes)
+  #   I-131:  692400 s (8 days)
+  half_life_seconds: 21600.0
+  enforce_lambda_ge_phys: true
+
+# Masking strategy
+mask:
+  mode: otsu              # options: otsu, provided, none
+  provided_path: null     # if mode=provided, path to mask image
+  min_fraction_of_max: 0.02
+
+# Denoising
+denoise:
+  enabled: true
+  method: masked_gaussian
+  sigma_vox: 1.2
+
+# Noise floor (voxel validity filtering)
+noise_floor:
+  enabled: true
+  mode: relative          # options: absolute, relative
+  absolute_bq_per_ml: 0.0
+  relative_fraction_of_voxel_max: 0.01  # 1% of voxel max
+  behavior: exclude
+
+# Model selection strategy
+model_selection:
+  mode: auto              # automatic classification into rising/hump/falling
+  min_points_for_gamma: 3
+
+# Integration parameters
+integration:
+  start_time_seconds: 0.0
+  tail_mode: phys         # options: phys (physical decay), none
+  rising_tail_mode: phys  # for rising curves
+
+# Bootstrap (uncertainty estimation)
+bootstrap:
+  enabled: false          # set to true for uncertainty estimates
+  n: 50
+  seed: 0
+  reclassify_each_replicate: true
+
+# Performance tuning
+performance:
+  chunk_size_vox: 500000  # process voxels in chunks (0 = no chunking)
+  enable_profiling: false
+
+# Regional ROI analysis (optional)
+regions:
+  enabled: false
+  label_map_path: null
+  mode: roi_aggregate
+  aggregation: mean
+  voxel_level_r2: false
+  classes: {}
+  scaling:
+    mode: tref
+    reference_time: peak
+
+# Single-timepoint mode (disabled for this example)
+single_time:
+  enabled: false

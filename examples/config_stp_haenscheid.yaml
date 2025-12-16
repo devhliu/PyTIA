@@ -1,0 +1,62 @@
+################################################################################
+# PyTIA Configuration: Single-Timepoint TIA (Hänscheid Method)
+#
+# Compute TIA using effective half-life (accounting for biological clearance).
+# Formula: TIA = A(t) / λ_eff,  where λ_eff = ln(2) / t_half_eff
+#
+# Usage:
+#   pytia run --config config_stp_haenscheid.yaml
+################################################################################
+
+inputs:
+  images:
+    - activity.nii.gz
+  times:
+    - 0.0
+  mask: null
+
+io:
+  output_dir: ./output/stp_haenscheid
+  prefix: stp_haenscheid
+
+time:
+  unit: seconds
+
+physics:
+  # Physical half-life (used as fallback if effective HL not specified)
+  half_life_seconds: 6600.0
+
+mask:
+  mode: otsu
+  min_fraction_of_max: 0.02
+
+denoise:
+  enabled: true
+  sigma_vox: 1.2
+
+noise_floor:
+  enabled: true
+  mode: relative
+  relative_fraction_of_voxel_max: 0.01
+
+bootstrap:
+  enabled: false
+
+performance:
+  chunk_size_vox: 500000
+
+regions:
+  enabled: false
+
+# Single-timepoint configuration - Hänscheid method
+single_time:
+  enabled: true
+  method: haenscheid
+  
+  # Effective half-life in human body (seconds)
+  # Accounts for both radioactive decay AND biological clearance/metabolism
+  # Examples for common tracers:
+  #   F-18 FDG: 7200 s (2 hours)
+  #   Tc-99m: 21600 s (6 hours, same as physical for most Tc agents)
+  #   I-131: may be 80000+ s (accounting for thyroid uptake)
+  haenscheid_eff_half_life_seconds: 7200.0
