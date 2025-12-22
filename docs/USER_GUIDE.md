@@ -353,14 +353,16 @@ See `examples/` folder for runnable examples:
 
 ### Status Codes
 
-| Code | Meaning | Notes |
-|------|---------|-------|
-| 0 | Outside mask | Background |
-| 1 | Valid | ✓ Valid TIA computed |
-| 2 | Invalid params | λ ≤ 0 or NaN |
-| 3 | Fit failed | Missing config |
-| 4 | Below floor | Activity below noise threshold |
-| 5 | Nonphysical | Unphysical parameters |
+The `status_id.nii.gz` output map provides a voxel-wise report on the outcome of the TIA calculation. Each voxel is assigned an integer code.
+
+| Code | Status                                  | Description                                                                                             |
+| :--- | :-------------------------------------- | :------------------------------------------------------------------------------------------------------ |
+| 0    | `outside mask/background`               | The voxel was outside the processing mask and was ignored.                                              |
+| 1    | `ok`                                    | A valid TIA value was successfully computed.                                                            |
+| 2    | `not applicable: <2 valid points`        | The voxel had fewer than two valid data points after noise filtering, so no model could be fit.         |
+| 3    | `fit failed`                            | A model was attempted but failed to converge. This can happen with very noisy data or missing configuration (e.g., `physics.half_life_seconds` for hybrid models). |
+| 4    | `all points below noise floor`          | All activity timepoints for this voxel were below the configured noise floor and were excluded.         |
+| 5    | `nonphysical parameters`                | The model fit produced parameters that are not physically plausible.                                    |
 
 ### Model IDs (Multi-Timepoint)
 
