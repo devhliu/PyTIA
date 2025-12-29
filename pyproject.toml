@@ -34,6 +34,7 @@ pytia = "pytia.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pytia*"]
+where = ["src"]
 
 [tool.ruff]
 line-length = 100

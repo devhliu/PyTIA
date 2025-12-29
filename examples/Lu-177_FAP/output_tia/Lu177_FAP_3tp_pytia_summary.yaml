@@ -1,0 +1,96 @@
+pytia_version: 0.1.0
+times_seconds:
+- 14400.0
+- 86400.0
+- 172800.0
+voxel_volume_ml: 0.689294633007991
+status_legend:
+  0: outside mask/background
+  1: ok
+  2: 'not applicable: <2 valid points'
+  3: fit failed
+  4: all points below noise floor
+  5: nonphysical parameters
+status_counts:
+  ok: 325664
+  'not applicable: <2 valid points': 30688
+timing_ms:
+  load_sort_ms: 172.7513590012677
+  mask_denoise_ms: 75.23140800003603
+  voxel_fit_ms: 10032.35871600009
+  bootstrap_ms: 473094.0136270001
+  assemble_ms: 9.037569998326944
+  save_ms: 220.2252419992874
+config:
+  io:
+    output_dir: examples/Lu-177_FAP/output_tia
+    prefix: Lu177_FAP_3tp
+    save_intermediate: false
+    dtype: float32
+    write_summary_yaml: true
+    write_status_map: true
+  time:
+    unit: hours
+    sort_timepoints: true
+  physics:
+    half_life_seconds: 574302.48
+    enforce_lambda_ge_phys: true
+  mask:
+    mode: none
+    provided_path: null
+    min_fraction_of_max: 0.02
+  denoise:
+    enabled: true
+    method: masked_gaussian
+    sigma_vox: 1.2
+  noise_floor:
+    enabled: true
+    mode: relative
+    absolute_bq_per_ml: 0.0
+    relative_fraction_of_voxel_max: 0.01
+    behavior: exclude
+  model_selection:
+    mode: auto
+    min_points_for_gamma: 3
+  integration:
+    start_time_seconds: 0.0
+    tail_mode: phys
+    rising_tail_mode: phys
+    min_tail_points: 2
+    fit_tail_slope: false
+    lambda_phys_constraint: true
+    include_t0: true
+  bootstrap:
+    enabled: true
+    n: 50
+    seed: 0
+    reclassify_each_replicate: true
+  performance:
+    chunk_size_vox: 500000
+    enable_profiling: false
+  regions:
+    enabled: false
+    label_map_path: null
+    mode: roi_aggregate
+    aggregation: mean
+    voxel_level_r2: false
+    classes: {}
+    scaling:
+      mode: tref
+      reference_time: peak
+  single_time:
+    enabled: false
+    method: phys
+    haenscheid_eff_half_life_seconds: null
+    half_life_seconds: null
+    label_map_path: null
+    label_half_lives: {}
+  inputs:
+    images:
+    - examples/Lu-177_FAP/input_multi-points/SPECT-004H_reg.nii.gz
+    - examples/Lu-177_FAP/input_multi-points/SPECT-024H_reg.nii.gz
+    - examples/Lu-177_FAP/input_multi-points/SPECT-048H_reg.nii.gz
+    times:
+    - 4.0
+    - 24.0
+    - 48.0

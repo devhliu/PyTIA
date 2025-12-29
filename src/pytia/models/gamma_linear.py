@@ -76,7 +76,16 @@ def fit_gamma_linear_wls(
     ok = np.zeros((N,), dtype=bool)
     ok[enough] = np.isfinite(det) & (np.abs(det) > 1e-12)
     if np.any(ok):
-        params[ok] = np.linalg.solve(G[ok], b[ok])
+        # Fix boolean indexing to maintain proper shape
+        ok_indices = np.where(ok)[0]
+        if len(ok_indices) > 0:
+            # Use list comprehension to solve each system individually
+            for i in ok_indices:
+                if np.linalg.matrix_rank(G[i]) == 3:  # Check if matrix is invertible
+                    try:
+                        params[i] = np.linalg.solve(G[i], b[i])
+                    except np.linalg.LinAlgError:
+                        pass  # Keep as NaN
 
     lnK = params[:, 0]
     alpha = params[:, 1]

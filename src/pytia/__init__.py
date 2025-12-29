@@ -12,6 +12,15 @@ Supports:
 from .config import Config
 from .engine import Results, run_tia
 from .io import load_images, voxel_volume_ml, make_like, stack_4d
+from .nifti_api import (
+    run_tia_from_nifti,
+    run_single_timepoint_tia,
+    load_nifti_as_array,
+    save_array_as_nifti,
+    get_nifti_info,
+    extract_roi_stats,
+    compare_results,
+)
 
 __version__ = "0.1.0"
 
@@ -23,4 +32,11 @@ __all__ = [
     "voxel_volume_ml",
     "make_like",
     "stack_4d",
+    "run_tia_from_nifti",
+    "run_single_timepoint_tia",
+    "load_nifti_as_array",
+    "save_array_as_nifti",
+    "get_nifti_info",
+    "extract_roi_stats",
+    "compare_results",
 ]

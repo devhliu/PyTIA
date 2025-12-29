@@ -67,8 +67,12 @@ def default_config() -> dict[str, Any]:
         "model_selection": {"mode": "auto", "min_points_for_gamma": 3},
         "integration": {
             "start_time_seconds": 0.0,
-            "tail_mode": "phys",  # phys | none
+            "tail_mode": "phys",  # phys | fitted | hybrid | none
             "rising_tail_mode": "phys",  # phys | peak_at_last
+            "min_tail_points": 2,  # minimum points for fitted tail
+            "fit_tail_slope": False,  # enable fitted tail slope
+            "lambda_phys_constraint": True,  # enforce lambda >= lambda_phys
+            "include_t0": True,  # include (t=0, A=0) in integration
         },
         "bootstrap": {
             "enabled": True,

@@ -16,6 +16,10 @@ from .models.gamma_linear import fit_gamma_linear_wls, tia_from_gamma_params
 from .models.hybrid import tia_trapz_plus_phys_tail
 from .models.hybrid_predict import hybrid_piecewise_hat_at_samples
 from .models.monoexp import fit_monoexp_tail, tia_monoexp_with_triangle_uptake
+from .models.biexp import fit_biexp, tia_from_biexp_params
+from .models.uptake_washout import fit_linear_uptake_monoexp_washout_matrix, tia_linear_uptake_monoexp_washout
+from .models.rectangular_uptake import fit_rectangular_uptake_monoexp_washout_matrix, tia_rectangular_uptake_monoexp_washout
+from .models.three_phase import fit_three_phase_exp, tia_from_three_phase_params
 from .noise import clamp_negative_to_zero, compute_noise_floor, valid_mask_from_floor
 from .types import Results
 from .uncertainty import residual_bootstrap
@@ -409,11 +413,17 @@ def run_tia(
             if region_class == "hump" and (default_model in (None, "gamma")) and ("gamma" in allowed or not allowed):
                 if np.any(t_s <= 0):
                     # cannot do gamma linear if t includes 0
-                    if lambda_phys is None:
+                    tail_mode = cfg["integration"]["tail_mode"]
+                    if lambda_phys is None and tail_mode not in ["fitted", "hybrid"]:
                         status_id[vox_mask] = STATUS_FIT_FAILED
                         continue
-                    tia_reg_arr, Ahat_reg2, r2_reg = tia_trapz_plus_phys_tail(
-                        Areg[None, :], t_s, valid_reg[None, :], lambda_phys=lambda_phys, include_t0=True
+                    tia_reg_arr, Ahat_reg2, r2_reg, _ = tia_trapz_plus_phys_tail(
+                        Areg[None, :], t_s, valid_reg[None, :], lambda_phys=lambda_phys,
+                        include_t0=cfg["integration"]["include_t0"],
+                        tail_mode=tail_mode,
+                        min_tail_points=cfg["integration"]["min_tail_points"],
+                        fit_tail_slope=cfg["integration"]["fit_tail_slope"],
+                        lambda_phys_constraint=cfg["physics"]["enforce_lambda_ge_phys"]
                     )
                     tia_reg = float(tia_reg_arr[0])
                     region_model_id = 11
@@ -440,11 +450,17 @@ def run_tia(
                 region_tpeak = float(t_s[peak_index[0]])
                 region_r2 = float(r2_reg[0])
             else:
-                if lambda_phys is None:
+                tail_mode = cfg["integration"]["tail_mode"]
+                if lambda_phys is None and tail_mode not in ["fitted", "hybrid"]:
                     status_id[vox_mask] = STATUS_FIT_FAILED
                     continue
-                tia_reg_arr, Ahat_reg, r2_reg = tia_trapz_plus_phys_tail(
-                    Areg[None, :], t_s, valid_reg[None, :], lambda_phys=lambda_phys, include_t0=True
+                tia_reg_arr, Ahat_reg, r2_reg, _ = tia_trapz_plus_phys_tail(
+                    Areg[None, :], t_s, valid_reg[None, :], lambda_phys=lambda_phys,
+                    include_t0=cfg["integration"]["include_t0"],
+                    tail_mode=tail_mode,
+                    min_tail_points=cfg["integration"]["min_tail_points"],
+                    fit_tail_slope=cfg["integration"]["fit_tail_slope"],
+                    lambda_phys_constraint=cfg["physics"]["enforce_lambda_ge_phys"]
                 )
                 tia_reg = float(tia_reg_arr[0])
                 region_model_id = 10 if region_class == "rising" else 11
@@ -528,10 +544,16 @@ def run_tia(
                                 )[0]
                             )
                         else:
-                            if lambda_phys is None:
+                            tail_mode = cfg["integration"]["tail_mode"]
+                            if lambda_phys is None and tail_mode not in ["fitted", "hybrid"]:
                                 continue
-                            tia_s, _, _ = tia_trapz_plus_phys_tail(
-                                Astar[None, :], t_s, valid_star[None, :], lambda_phys=lambda_phys, include_t0=True
+                            tia_s, _, _, _ = tia_trapz_plus_phys_tail(
+                                Astar[None, :], t_s, valid_star[None, :], lambda_phys=lambda_phys,
+                                include_t0=cfg["integration"]["include_t0"],
+                                tail_mode=tail_mode,
+                                min_tail_points=cfg["integration"]["min_tail_points"],
+                                fit_tail_slope=cfg["integration"]["fit_tail_slope"],
+                                lambda_phys_constraint=cfg["physics"]["enforce_lambda_ge_phys"]
                             )
                             tia_bs[b] = float(tia_s[0])
                     except Exception:
@@ -605,29 +627,77 @@ def run_tia(
                     hump2 = hump.copy()
                     hump[:] = False
                 else:
-                    params, tpk, Ahat, r2_h = fit_gamma_linear_wls(A[hump], t_s, valid[hump], lambda_phys=lambda_phys)
-                    tia_h = tia_from_gamma_params(params)
-                    tia_c[hump] = tia_h
-                    r2_c[hump] = r2_h
-                    tpeak_c[hump] = tpk
-                    model_c[hump] = 30
-                    if do_boot:
-                        Ahat0_all[sl][hump] = Ahat
+                    # Try 3-phase model for hump curves with sufficient points (>= 6)
+                    hump_3phase = hump & (n_valid >= 6)
+                    hump_biexp = hump & (n_valid >= 4) & (~hump_3phase)
+                    hump_gamma = hump & (~hump_biexp) & (~hump_3phase)
+                    
+                    if np.any(hump_3phase):
+                        params, tpk, Ahat, r2_3p = fit_three_phase_exp(
+                            A[hump_3phase, :], t_s, valid[hump_3phase, :], lambda_phys=lambda_phys, peak_index=peak_index[hump_3phase]
+                        )
+                        tia_3p = tia_from_three_phase_params(params)
+                        tia_c[hump_3phase] = tia_3p
+                        r2_c[hump_3phase] = r2_3p
+                        tpeak_c[hump_3phase] = tpk
+                        model_c[hump_3phase] = 60
+                        if do_boot:
+                            Ahat0_all[sl][hump_3phase] = Ahat
+                    
+                    if np.any(hump_biexp):
+                        params, tpk, Ahat, r2_be = fit_biexp(
+                            A[hump_biexp, :], t_s, valid[hump_biexp, :], lambda_phys=lambda_phys, peak_index=peak_index[hump_biexp]
+                        )
+                        tia_be = tia_from_biexp_params(params)
+                        tia_c[hump_biexp] = tia_be
+                        r2_c[hump_biexp] = r2_be
+                        tpeak_c[hump_biexp] = tpk
+                        model_c[hump_biexp] = 40
+                        if do_boot:
+                            Ahat0_all[sl][hump_biexp] = Ahat
+                    
+                    if np.any(hump_gamma):
+                        params, tpk, Ahat, r2_h = fit_gamma_linear_wls(A[hump_gamma, :], t_s, valid[hump_gamma, :], lambda_phys=lambda_phys)
+                        tia_h = tia_from_gamma_params(params)
+                        tia_c[hump_gamma] = tia_h
+                        r2_c[hump_gamma] = r2_h
+                        tpeak_c[hump_gamma] = tpk
+                        model_c[hump_gamma] = 30
+                        if do_boot:
+                            Ahat0_all[sl][hump_gamma] = Ahat
 
             falling = (cls == CLASS_FALLING) & (~insufficient) & (~all_below)
             if np.any(falling):
-                lam, Ahat, r2_f = fit_monoexp_tail(
-                    A[falling], t_s, valid[falling], lambda_phys=lambda_phys, peak_index=peak_index[falling]
-                )
-                tia_f = tia_monoexp_with_triangle_uptake(A[falling], t_s, valid[falling], lam, peak_index[falling])
-                tia_c[falling] = tia_f
-                r2_c[falling] = r2_f
-                tpeak_c[falling] = np.take_along_axis(
-                    t_s[None, :], peak_index[falling][:, None], axis=1
-                )[:, 0].astype(np.float32)
-                model_c[falling] = 20
-                if do_boot:
-                    Ahat0_all[sl][falling] = Ahat
+                # Try uptake-washout models for falling curves with sufficient points (>= 4)
+                falling_uw = falling & (n_valid >= 4)
+                falling_mono = falling & (~falling_uw)
+                
+                if np.any(falling_uw):
+                    # Try linear uptake + mono-exponential washout
+                    params, tpk, Ahat, r2_uw = fit_linear_uptake_monoexp_washout_matrix(
+                        A[falling_uw, :], t_s, valid[falling_uw, :], lambda_phys=lambda_phys, peak_index=peak_index[falling_uw]
+                    )
+                    tia_uw = tia_linear_uptake_monoexp_washout(params, tpk)
+                    tia_c[falling_uw] = tia_uw
+                    r2_c[falling_uw] = r2_uw
+                    tpeak_c[falling_uw] = tpk
+                    model_c[falling_uw] = 50
+                    if do_boot:
+                        Ahat0_all[sl][falling_uw] = Ahat
+                
+                if np.any(falling_mono):
+                    lam, Ahat, r2_f = fit_monoexp_tail(
+                        A[falling_mono, :], t_s, valid[falling_mono, :], lambda_phys=lambda_phys, peak_index=peak_index[falling_mono]
+                    )
+                    tia_f = tia_monoexp_with_triangle_uptake(A[falling_mono, :], t_s, valid[falling_mono, :], lam, peak_index[falling_mono])
+                    tia_c[falling_mono] = tia_f
+                    r2_c[falling_mono] = r2_f
+                    tpeak_c[falling_mono] = np.take_along_axis(
+                        t_s[None, :], peak_index[falling_mono][:, None], axis=1
+                    )[:, 0].astype(np.float32)
+                    model_c[falling_mono] = 20
+                    if do_boot:
+                        Ahat0_all[sl][falling_mono] = Ahat
 
             # Hybrid for rising + ambiguous + gamma fallback (if times<=0)
             hybrid_mask = ((cls == CLASS_RISING) | (cls == 4)) & (~insufficient) & (~all_below)
@@ -635,11 +705,17 @@ def run_tia(
                 hybrid_mask = hybrid_mask | hump2
 
             if np.any(hybrid_mask):
-                if lambda_phys is None:
+                tail_mode = cfg["integration"]["tail_mode"]
+                if lambda_phys is None and tail_mode not in ["fitted", "hybrid"]:
                     status[hybrid_mask] = STATUS_FIT_FAILED
                 else:
-                    tia_hy, _, _ = tia_trapz_plus_phys_tail(
-                        A[hybrid_mask], t_s, valid[hybrid_mask], lambda_phys=lambda_phys, include_t0=True
+                    tia_hy, _, _, _ = tia_trapz_plus_phys_tail(
+                        A[hybrid_mask], t_s, valid[hybrid_mask], lambda_phys=lambda_phys,
+                        include_t0=cfg["integration"]["include_t0"],
+                        tail_mode=tail_mode,
+                        min_tail_points=cfg["integration"]["min_tail_points"],
+                        fit_tail_slope=cfg["integration"]["fit_tail_slope"],
+                        lambda_phys_constraint=cfg["physics"]["enforce_lambda_ge_phys"]
                     )
                     # Improved R2: compute Ahat piecewise at samples
                     Ahat_hy = hybrid_piecewise_hat_at_samples(A[hybrid_mask], valid[hybrid_mask], t_s)
@@ -702,10 +778,28 @@ def run_tia(
                 hump_b = (cls_b == CLASS_HUMP) & ok_b & (n_valid_b >= int(cfg["model_selection"]["min_points_for_gamma"]))
                 if np.any(hump_b) and not np.any(t_s <= 0):
                     try:
-                        params_b, _, _, _ = fit_gamma_linear_wls(
-                            Astar[hump_b], t_s, valid_b[hump_b], lambda_phys=lambda_phys
-                        )
-                        tia_b[hump_b] = tia_from_gamma_params(params_b)
+                        # Try 3-phase for curves with >= 6 points
+                        hump_3p_b = hump_b & (n_valid_b >= 6)
+                        hump_be_b = hump_b & (n_valid_b >= 4) & (~hump_3p_b)
+                        hump_g_b = hump_b & (~hump_be_b) & (~hump_3p_b)
+                        
+                        if np.any(hump_3p_b):
+                            params_3p_b, _, _, _ = fit_three_phase_exp(
+                                Astar[hump_3p_b], t_s, valid_b[hump_3p_b], lambda_phys=lambda_phys, peak_index=peak_b[hump_3p_b]
+                            )
+                            tia_b[hump_3p_b] = tia_from_three_phase_params(params_3p_b)
+                        
+                        if np.any(hump_be_b):
+                            params_b, _, _, _ = fit_biexp(
+                                Astar[hump_be_b], t_s, valid_b[hump_be_b], lambda_phys=lambda_phys, peak_index=peak_b[hump_be_b]
+                            )
+                            tia_b[hump_be_b] = tia_from_biexp_params(params_b)
+                        
+                        if np.any(hump_g_b):
+                            params_b, _, _, _ = fit_gamma_linear_wls(
+                                Astar[hump_g_b], t_s, valid_b[hump_g_b], lambda_phys=lambda_phys
+                            )
+                            tia_b[hump_g_b] = tia_from_gamma_params(params_b)
                     except Exception:
                         pass
 
@@ -713,17 +807,34 @@ def run_tia(
                 if np.any(falling_b):
                     A_for_peak_b = np.where(valid_b, Astar, -np.inf)
                     peak_b = np.argmax(A_for_peak_b, axis=1).astype(np.int64)
-                    lam_b, _, _ = fit_monoexp_tail(
-                        Astar[falling_b], t_s, valid_b[falling_b], lambda_phys=lambda_phys, peak_index=peak_b[falling_b]
-                    )
-                    tia_b[falling_b] = tia_monoexp_with_triangle_uptake(
-                        Astar[falling_b], t_s, valid_b[falling_b], lam_b, peak_b[falling_b]
-                    )
+                    # Try uptake-washout for curves with >= 4 points
+                    falling_uw_b = falling_b & (n_valid_b >= 4)
+                    falling_mono_b = falling_b & (~falling_uw_b)
+                    
+                    if np.any(falling_uw_b):
+                        params_uw_b, tpk_uw_b, _, _ = fit_linear_uptake_monoexp_washout_matrix(
+                            Astar[falling_uw_b], t_s, valid_b[falling_uw_b], lambda_phys=lambda_phys, peak_index=peak_b[falling_uw_b]
+                        )
+                        tia_b[falling_uw_b] = tia_linear_uptake_monoexp_washout(params_uw_b, tpk_uw_b)
+                    
+                    if np.any(falling_mono_b):
+                        lam_b, _, _ = fit_monoexp_tail(
+                            Astar[falling_mono_b], t_s, valid_b[falling_mono_b], lambda_phys=lambda_phys, peak_index=peak_b[falling_mono_b]
+                        )
+                        tia_b[falling_mono_b] = tia_monoexp_with_triangle_uptake(
+                            Astar[falling_mono_b], t_s, valid_b[falling_mono_b], lam_b, peak_b[falling_mono_b]
+                        )
 
                 hybrid_b = ((cls_b == CLASS_RISING) | (cls_b == 4)) & ok_b
-                if np.any(hybrid_b) and lambda_phys is not None:
-                    tia_hyb, _, _ = tia_trapz_plus_phys_tail(
-                        Astar[hybrid_b], t_s, valid_b[hybrid_b], lambda_phys=lambda_phys, include_t0=True
+                tail_mode = cfg["integration"]["tail_mode"]
+                if np.any(hybrid_b) and (lambda_phys is not None or tail_mode in ["fitted", "hybrid"]):
+                    tia_hyb, _, _, _ = tia_trapz_plus_phys_tail(
+                        Astar[hybrid_b], t_s, valid_b[hybrid_b], lambda_phys=lambda_phys,
+                        include_t0=cfg["integration"]["include_t0"],
+                        tail_mode=tail_mode,
+                        min_tail_points=cfg["integration"]["min_tail_points"],
+                        fit_tail_slope=cfg["integration"]["fit_tail_slope"],
+                        lambda_phys_constraint=cfg["physics"]["enforce_lambda_ge_phys"]
                     )
                     tia_b[hybrid_b] = tia_hyb
 
