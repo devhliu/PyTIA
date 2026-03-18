@@ -10,6 +10,9 @@ from pytia.config import Config
 from pytia.engine import run_tia
 
 
+VOXEL_ML_IDENTITY_AFFINE = 1.0 / 1000.0
+
+
 def create_simple_image(shape=(10, 10, 10), value=100.0):
     """Create a simple NIfTI image with constant values."""
     data = np.full(shape, value, dtype=np.float32)
@@ -20,9 +23,11 @@ def create_simple_image(shape=(10, 10, 10), value=100.0):
 def create_label_image(shape=(10, 10, 10)):
     """Create a label/ROI image with three regions."""
     data = np.zeros(shape, dtype=np.int32)
-    data[0:3, :, :] = 1  # Label 1
-    data[3:6, :, :] = 2  # Label 2
-    data[6:, :, :] = 3   # Label 3
+    n0 = shape[0] // 3
+    n1 = (2 * shape[0]) // 3
+    data[0:n0, :, :] = 1  # Label 1
+    data[n0:n1, :, :] = 2  # Label 2
+    data[n1:, :, :] = 3  # Label 3
     affine = np.eye(4)
     return nib.Nifti1Image(data, affine)
 
@@ -50,8 +55,8 @@ class TestSingleTimePointPhysicalDecay:
 
             result = run_tia([img_path], times=[0.0], config=config)
 
-            # With lambda = ln(2)/3600, TIA = 100 / lambda = 100 * 3600 / ln(2) ≈ 519615
-            expected_tia = 100.0 * 3600.0 / np.log(2.0)
+            # Engine converts activity density to Bq/voxel: A_vox = A_density * voxel_ml.
+            expected_tia = 100.0 * VOXEL_ML_IDENTITY_AFFINE * 3600.0 / np.log(2.0)
             assert result.tia_img is not None
             tia_data = np.asarray(result.tia_img.dataobj)
             assert np.any(np.isfinite(tia_data))
@@ -102,7 +107,7 @@ class TestSingleTimePointHaenscheid:
 
             result = run_tia([img_path], times=[0.0], config=config)
             tia_data = np.asarray(result.tia_img.dataobj)
-            expected_tia = 100.0 * eff_hl / np.log(2.0)
+            expected_tia = 100.0 * VOXEL_ML_IDENTITY_AFFINE * eff_hl / np.log(2.0)
             assert np.allclose(tia_data[2, 2, 2], expected_tia, rtol=0.01)
 
     def test_haenscheid_fallback_to_phys_halflife(self):
@@ -124,7 +129,7 @@ class TestSingleTimePointHaenscheid:
 
             result = run_tia([img_path], times=[0.0], config=config)
             tia_data = np.asarray(result.tia_img.dataobj)
-            expected_tia = 100.0 * 3600.0 / np.log(2.0)
+            expected_tia = 100.0 * VOXEL_ML_IDENTITY_AFFINE * 3600.0 / np.log(2.0)
             assert np.allclose(tia_data[2, 2, 2], expected_tia, rtol=0.01)
 
 
@@ -149,7 +154,7 @@ class TestSingleTimePointPriorHalfLife:
 
             result = run_tia([img_path], times=[0.0], config=config)
             tia_data = np.asarray(result.tia_img.dataobj)
-            expected_tia = 100.0 * 5400.0 / np.log(2.0)
+            expected_tia = 100.0 * VOXEL_ML_IDENTITY_AFFINE * 5400.0 / np.log(2.0)
             assert np.allclose(tia_data[2, 2, 2], expected_tia, rtol=0.01)
 
     def test_prior_halflife_label_map(self):
@@ -185,15 +190,15 @@ class TestSingleTimePointPriorHalfLife:
 
             # Check different labels have different TIA values (scaled by their half-life)
             # Label 1 region (indices 0-2): hl=1800
-            label1_tia = 100.0 * 1800.0 / np.log(2.0)
+            label1_tia = 100.0 * VOXEL_ML_IDENTITY_AFFINE * 1800.0 / np.log(2.0)
             assert np.allclose(tia_data[1, 1, 1], label1_tia, rtol=0.05)
 
-            # Label 2 region (indices 3-5): hl=3600
-            label2_tia = 100.0 * 3600.0 / np.log(2.0)
-            assert np.allclose(tia_data[4, 4, 4], label2_tia, rtol=0.05)
+            # Label 2 region (middle third): hl=3600
+            label2_tia = 100.0 * VOXEL_ML_IDENTITY_AFFINE * 3600.0 / np.log(2.0)
+            assert np.allclose(tia_data[3, 3, 3], label2_tia, rtol=0.05)
 
-            # Label 3 region (indices 6+): hl=5400
-            label3_tia = 100.0 * 5400.0 / np.log(2.0)
+            # Label 3 region (last third): hl=5400
+            label3_tia = 100.0 * VOXEL_ML_IDENTITY_AFFINE * 5400.0 / np.log(2.0)
             assert np.allclose(tia_data[5, 5, 5], label3_tia, rtol=0.05)
 
     def test_prior_halflife_missing_halflife(self):

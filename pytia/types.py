@@ -1,15 +1,20 @@
+"""Data types returned by the PyTIA engine."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import nibabel as nib
-import numpy as np
+if TYPE_CHECKING:
+    import nibabel as nib
+    import numpy as np
 
 
 @dataclass
 class Results:
+    """Container for all outputs produced by :func:`pytia.run_tia`."""
+
     tia_img: nib.spatialimages.SpatialImage
     r2_img: nib.spatialimages.SpatialImage
     sigma_tia_img: nib.spatialimages.SpatialImage

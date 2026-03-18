@@ -405,10 +405,21 @@ Checks:
 - Required sections present
 - Option types correct
 - File paths accessible (if mode=provided)
+- Unknown keys are rejected (fail-fast), including nested typos such as
+  `physics.halflife_seconds` instead of `physics.half_life_seconds`
+
+### Unknown-key policy
+
+PyTIA validates user-supplied keys against the runtime schema before merging with defaults.
+This prevents silent misconfiguration caused by spelling mistakes or stale options.
+
+For dynamic maps:
+- `regions.classes` keys must be integer-like label IDs (for example `"1"`, `"2"`).
+- `single_time.label_half_lives` keys must be integer-like label IDs.
 
 ## Best Practices
 
-1. **Always specify `outputs_dir`** — Prevents accidental overwrites
+1. **Always specify `output_dir`** — Prevents accidental overwrites
 2. **Use `seed` in bootstrap** — For reproducible results
 3. **Enable profiling** during development — Optimize performance
 4. **Test with validation** — Before batch processing

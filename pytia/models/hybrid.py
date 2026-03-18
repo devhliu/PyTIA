@@ -1,3 +1,5 @@
+"""Trapezoidal integration with physical-decay tail extrapolation."""
+
 from __future__ import annotations
 
 import numpy as np

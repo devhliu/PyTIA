@@ -1,25 +1,41 @@
+"""Image I/O: loading, stacking, and spatial helpers."""
+
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import nibabel as nib
 import numpy as np
 
 
-def load_images(images: Sequence[str | Path | nib.spatialimages.SpatialImage]) -> list[nib.spatialimages.SpatialImage]:
+def load_images(
+    images: str
+    | Path
+    | nib.spatialimages.SpatialImage
+    | Sequence[str | Path | nib.spatialimages.SpatialImage],
+) -> list[nib.spatialimages.SpatialImage]:
+    if isinstance(images, (str, Path)) or hasattr(images, "shape"):
+        images = [images]
+
     out: list[nib.spatialimages.SpatialImage] = []
     for im in images:
         if isinstance(im, (str, Path)):
             out.append(nib.load(str(im)))
         else:
             out.append(im)
+
+    if len(out) == 0:
+        raise ValueError("Need at least 1 timepoint/image.")
+
     return out
 
 
-def stack_4d(imgs: Sequence[nib.spatialimages.SpatialImage]) -> tuple[np.ndarray, nib.spatialimages.SpatialImage]:
-    if len(imgs) < 2:
-        raise ValueError("Need at least 2 timepoints/images.")
+def stack_4d(
+    imgs: Sequence[nib.spatialimages.SpatialImage],
+) -> tuple[np.ndarray, nib.spatialimages.SpatialImage]:
+    if len(imgs) < 1:
+        raise ValueError("Need at least 1 timepoint/image.")
     ref = imgs[0]
     shape3 = ref.shape[:3]
     aff = ref.affine
@@ -38,7 +54,9 @@ def voxel_volume_ml(img: nib.spatialimages.SpatialImage) -> float:
     return abs(det) / 1000.0
 
 
-def make_like(ref: nib.spatialimages.SpatialImage, data: np.ndarray) -> nib.spatialimages.SpatialImage:
+def make_like(
+    ref: nib.spatialimages.SpatialImage, data: np.ndarray
+) -> nib.spatialimages.SpatialImage:
     return nib.Nifti1Image(data, affine=ref.affine, header=ref.header)
 
 

@@ -10,17 +10,18 @@ Supports:
 """
 
 from .config import Config
-from .engine import Results, run_tia
-from .io import load_images, voxel_volume_ml, make_like, stack_4d
-
-__version__ = "0.1.0"
+from .engine import run_tia
+from .io import load_images, make_like, stack_4d, voxel_volume_ml
+from .types import Results
+from .version import __version__
 
 __all__ = [
-    "run_tia",
-    "Results",
+    "__version__",
     "Config",
+    "Results",
     "load_images",
-    "voxel_volume_ml",
     "make_like",
+    "run_tia",
     "stack_4d",
+    "voxel_volume_ml",
 ]

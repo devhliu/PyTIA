@@ -1,3 +1,5 @@
+"""Mono-exponential tail fitting and TIA with triangular uptake."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -63,7 +65,11 @@ def fit_monoexp_tail(
 
 
 def tia_monoexp_with_triangle_uptake(
-    A: np.ndarray, times: np.ndarray, valid: np.ndarray, lambda_eff: np.ndarray, peak_index: np.ndarray
+    A: np.ndarray,
+    times: np.ndarray,
+    valid: np.ndarray,
+    lambda_eff: np.ndarray,
+    peak_index: np.ndarray,
 ) -> np.ndarray:
     """
     TIA = 0.5*A_peak*t_peak + A_peak/lambda_eff
@@ -73,7 +79,9 @@ def tia_monoexp_with_triangle_uptake(
     t = times.astype(np.float64)
     # peak time/value
     Apeak = np.take_along_axis(A, peak_index[:, None], axis=1)[:, 0].astype(np.float64)
-    tpeak = np.take_along_axis(np.broadcast_to(t[None, :], (N, T)), peak_index[:, None], axis=1)[:, 0]
+    tpeak = np.take_along_axis(np.broadcast_to(t[None, :], (N, T)), peak_index[:, None], axis=1)[
+        :, 0
+    ]
 
     ok = np.isfinite(Apeak) & np.isfinite(tpeak) & np.isfinite(lambda_eff) & (lambda_eff > 0)
     ok &= np.take_along_axis(valid, peak_index[:, None], axis=1)[:, 0]

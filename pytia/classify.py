@@ -1,8 +1,13 @@
+"""Time-activity curve shape classification.
+
+Classifies each voxel's TAC as one of: falling, rising, hump, or ambiguous.
+"""
+
 from __future__ import annotations
 
 import numpy as np
 
-# class ids (voxel mode)
+# Class IDs (voxel mode)
 CLASS_FALLING = 1
 CLASS_RISING = 2
 CLASS_HUMP = 3
@@ -30,7 +35,8 @@ def classify_curves(A: np.ndarray, valid: np.ndarray, eps_rel: float = 0.02) -> 
     dA = np.diff(A, axis=1)
     dv = valid[:, 1:] & valid[:, :-1]
     # scale eps by voxel max to avoid noisy sign flips
-    mx = np.nanmax(np.where(valid, A, np.nan), axis=1)
+    max_valid = np.max(A_for_peak, axis=1)
+    mx = np.where(np.isfinite(max_valid), max_valid, 0.0)
     eps = np.maximum(mx * float(eps_rel), 1e-6)
     n_pos = np.sum((dA > eps[:, None]) & dv, axis=1)
     n_neg = np.sum((dA < -eps[:, None]) & dv, axis=1)

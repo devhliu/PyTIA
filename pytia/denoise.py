@@ -1,3 +1,5 @@
+"""Masked Gaussian denoising for 4-D activity volumes."""
+
 from __future__ import annotations
 
 import numpy as np

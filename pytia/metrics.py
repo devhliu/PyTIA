@@ -1,12 +1,21 @@
+"""Goodness-of-fit metrics for curve fitting."""
+
 from __future__ import annotations
 
 import numpy as np
 
 
 def r2_score(y: np.ndarray, yhat: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """
-    Vectorized R^2 per voxel. y,yhat shape (N_vox,T), valid shape (N_vox,T)
-    Returns (N_vox,) float
+    """Vectorized coefficient of determination (R²) per voxel.
+
+    Parameters
+    ----------
+    y, yhat : ndarray, shape (N_vox, T)
+    valid : bool ndarray, shape (N_vox, T)
+
+    Returns
+    -------
+    ndarray, shape (N_vox,), dtype float32
     """
     yv = np.where(valid, y, np.nan)
     yhv = np.where(valid, yhat, np.nan)
@@ -16,6 +25,15 @@ def r2_score(y: np.ndarray, yhat: np.ndarray, valid: np.ndarray) -> np.ndarray:
     mu = np.nanmean(yv, axis=1)
     ss_tot = np.nansum((yv - mu[:, None]) ** 2, axis=1)
     r2 = np.full((y.shape[0],), np.nan, dtype=np.float32)
-    ok = np.isfinite(ss_res) & np.isfinite(ss_tot) & (ss_tot > 0)
-    r2[ok] = (1.0 - ss_res[ok] / ss_tot[ok]).astype(np.float32)
+    finite = np.isfinite(ss_res) & np.isfinite(ss_tot)
+
+    regular = finite & (ss_tot > 0)
+    r2[regular] = (1.0 - ss_res[regular] / ss_tot[regular]).astype(np.float32)
+
+    zero_var = finite & np.isclose(ss_tot, 0.0)
+    if np.any(zero_var):
+        perfect = zero_var & np.isclose(ss_res, 0.0)
+        imperfect = zero_var & ~perfect
+        r2[perfect] = 1.0
+        r2[imperfect] = 0.0
     return r2

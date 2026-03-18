@@ -95,16 +95,59 @@ bootstrap:
 **2. Run PyTIA from the command line:**
 
 ```bash
+pytia validate --config config.yaml
 pytia run --config config.yaml
 ```
 
 Output maps (`patient_01_tia.nii.gz`, `patient_01_r2.nii.gz`, etc.) will be saved in the `./pytia_output` directory.
 
+## CLI at a Glance
+
+```bash
+# Run analysis
+pytia run --config config.yaml
+
+# Validate config contract
+pytia validate --config config.yaml
+
+# Show config contents
+pytia info --config config.yaml
+
+# Show installed version
+pytia --version
+```
+
+## Configuration Contract
+
+PyTIA uses strict, fail-fast configuration validation:
+
+- Unknown keys are rejected before execution.
+- Enum/range/dependency checks are enforced at config load.
+- Single-timepoint aliases are accepted for compatibility (`haenscheid` / `hanscheid`, `prior_half_life` / `prior`).
+
 ## Documentation
 
-- **[docs/USER_GUIDE.md](docs/USER_GUIDE.md):** Detailed instructions on CLI and API usage, output interpretation, and troubleshooting.
-- **[docs/CONFIG.md](docs/CONFIG.md):** A complete reference for every option in the `config.yaml` file.
-- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md):** A developer-focused guide to the codebase structure.
+Canonical docs are indexed in **[docs/DOCUMENTATION_INDEX.md](docs/DOCUMENTATION_INDEX.md)**.
+
+- **[docs/QUICK_START.md](docs/QUICK_START.md):** shortest path to first successful run.
+- **[docs/USER_GUIDE.md](docs/USER_GUIDE.md):** end-to-end usage (CLI + Python API).
+- **[docs/CONFIG.md](docs/CONFIG.md):** complete configuration contract.
+- **[docs/STP_USER_GUIDE.md](docs/STP_USER_GUIDE.md):** single-timepoint workflow details.
+- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md):** runtime architecture and stable contracts.
+- **[docs/RELEASE.md](docs/RELEASE.md):** local/offline release checklist and benchmark workflow.
+
+## Local Release Workflow
+
+```bash
+# Standard local release gates
+scripts/release_checklist.sh
+
+# Optional strict mode (includes full test suite)
+scripts/release_checklist.sh --full
+
+# Performance baseline capture
+python scripts/benchmark_local.py --output-json ./benchmarks/latest.json
+```
 
 ## License
 

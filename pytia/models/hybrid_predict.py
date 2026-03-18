@@ -1,9 +1,13 @@
+"""Piecewise-linear prediction at sampled timepoints for hybrid models."""
+
 from __future__ import annotations
 
 import numpy as np
 
 
-def hybrid_piecewise_hat_at_samples(A: np.ndarray, valid: np.ndarray, times: np.ndarray) -> np.ndarray:
+def hybrid_piecewise_hat_at_samples(
+    A: np.ndarray, valid: np.ndarray, times: np.ndarray
+) -> np.ndarray:
     """
     Piecewise-linear Ahat at sampled times using nearest valid points left/right.
 
@@ -59,7 +63,7 @@ def hybrid_piecewise_hat_at_samples(A: np.ndarray, valid: np.ndarray, times: np.
     aL = A[ii, li]
     aR = A[ii, ri]
 
-    denom = (tR - tL)
+    denom = tR - tL
     denom = np.where(np.abs(denom) < 1e-12, np.nan, denom)
     w = (tJ - tL) / denom
 

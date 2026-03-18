@@ -1,3 +1,5 @@
+"""Body mask creation and loading utilities."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -16,10 +18,19 @@ def make_body_mask(data4: np.ndarray, min_fraction_of_max: float = 0.02) -> np.n
     flat = s[np.isfinite(s)]
     if flat.size == 0:
         return np.zeros(s.shape, dtype=bool)
+
+    smax = float(np.nanmax(flat))
+    if smax <= 0.0:
+        return np.zeros(s.shape, dtype=bool)
+
+    # Constant positive images make Otsu degenerate; keep all positive voxels.
+    if np.nanmin(flat) == smax:
+        return s > 0
+
     thr = threshold_otsu(flat)
     m = s > thr
     if min_fraction_of_max is not None and min_fraction_of_max > 0:
-        m &= s >= (float(np.nanmax(s)) * float(min_fraction_of_max))
+        m &= s >= (smax * float(min_fraction_of_max))
     return m
 
 
@@ -27,7 +38,9 @@ def load_mask(mask_path: str | Path) -> nib.spatialimages.SpatialImage:
     return nib.load(str(mask_path))
 
 
-def mask_to_bool(mask_img: nib.spatialimages.SpatialImage, ref_shape: tuple[int, int, int]) -> np.ndarray:
+def mask_to_bool(
+    mask_img: nib.spatialimages.SpatialImage, ref_shape: tuple[int, int, int]
+) -> np.ndarray:
     m = np.asanyarray(mask_img.dataobj)
     if m.shape[:3] != ref_shape:
         raise ValueError("Provided mask shape does not match input images.")

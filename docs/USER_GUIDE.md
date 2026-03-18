@@ -63,6 +63,9 @@ pytia validate --config config.yaml
 
 # View config file
 pytia info --config config.yaml
+
+# Show installed CLI version
+pytia --version
 ```
 
 **Advantages:**
@@ -107,7 +110,7 @@ pytia run --config config.yaml
 
 **Example:**
 ```bash
-pytia run --config examples/config_multitime.yaml
+pytia run --config examples/cli/configs/config_multitime.yaml
 ```
 
 ### Validate Configuration
@@ -140,6 +143,15 @@ pytia info --config config.yaml
 ```
 
 Displays config file contents (useful for verification before running).
+
+### Show PyTIA Version
+
+```bash
+pytia --version
+```
+
+Prints the installed CLI version. The same version is written to output summaries as
+`summary["pytia_version"]`.
 
 ## Python API
 
@@ -334,9 +346,12 @@ single_time:
 ```
 
 See `examples/` folder for runnable examples:
-- `example_multitime.py` — Multi-timepoint demo
-- `example_stp.py` — Single-timepoint demos
-- Config files in `examples/*.yaml`
+- `examples/python_api/example_multitime.py` — Multi-timepoint demo
+- `examples/python_api/example_stp.py` — Single-timepoint demos
+- `examples/python_api/debug_fap.py` — FAP analysis debugging
+- `examples/python_api/visualize_fap_results.py` — FAP visualization
+- CLI configs in `examples/cli/configs/*.yaml`
+- Example inputs in `examples/data/`
 
 ## Output
 
@@ -369,7 +384,7 @@ The `status_id.nii.gz` output map provides a voxel-wise report on the outcome of
 | Code | Model |
 |------|-------|
 | 10 | Hybrid (rising) |
-| 11 | Hybrid with phys tail |
+| 11 | Hybrid (non-rising fallback) |
 | 20 | Exponential (falling) |
 | 30 | Gamma-linear (hump) |
 
@@ -393,14 +408,29 @@ voxel_volume_ml: 8.0
 status_legend:
   0: "outside mask/background"
   1: "ok"
-  2: "not applicable: invalid decay rate"
+  2: "not applicable: <2 valid points"
   3: "fit failed"
   4: "all points below noise floor"
+
+model_legend:
+  10: "hybrid rising"
+  11: "hybrid non-rising"
+  20: "monoexp"
+  30: "gamma"
+  101: "single-time phys"
+  102: "single-time haenscheid"
+  103: "single-time prior_half_life"
 
 status_counts:
   ok: 125400
   outside mask/background: 10000
   all points below noise floor: 234
+
+model_counts:
+  gamma: 45200
+  monoexp: 32100
+  hybrid rising: 18000
+  hybrid non-rising: 100
 
 timing_ms:
   load_sort_ms: 245.3

@@ -1,12 +1,18 @@
+"""Core TIA computation engine."""
+
 from __future__ import annotations
 
+import time as _time
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
+import nibabel as nib
 import numpy as np
 import yaml
 
-from .classify import CLASS_FALLING, CLASS_HUMP, CLASS_RISING, classify_curves
+from .classify import CLASS_AMBIG, CLASS_FALLING, CLASS_HUMP, CLASS_RISING, classify_curves
 from .config import Config
 from .denoise import masked_gaussian
 from .io import ensure_dir, load_images, make_like, stack_4d, voxel_volume_ml
@@ -19,6 +25,7 @@ from .models.monoexp import fit_monoexp_tail, tia_monoexp_with_triangle_uptake
 from .noise import clamp_negative_to_zero, compute_noise_floor, valid_mask_from_floor
 from .types import Results
 from .uncertainty import residual_bootstrap
+from .version import __version__
 
 STATUS_OUTSIDE = 0
 STATUS_OK = 1
@@ -26,6 +33,14 @@ STATUS_NOT_APPLICABLE_INSUFFICIENT_POINTS = 2
 STATUS_FIT_FAILED = 3
 STATUS_ALL_BELOW_FLOOR = 4
 STATUS_NONPHYSICAL = 5
+
+MODEL_HYBRID_RISING = 10
+MODEL_HYBRID_NONRISING = 11
+MODEL_MONOEXP = 20
+MODEL_GAMMA = 30
+MODEL_SINGLE_TIME_PHYS = 101
+MODEL_SINGLE_TIME_HAENSCHEID = 102
+MODEL_SINGLE_TIME_PRIOR_HALF_LIFE = 103
 
 
 STATUS_LEGEND = {
@@ -35,6 +50,16 @@ STATUS_LEGEND = {
     int(STATUS_FIT_FAILED): "fit failed",
     int(STATUS_ALL_BELOW_FLOOR): "all points below noise floor",
     int(STATUS_NONPHYSICAL): "nonphysical parameters",
+}
+
+MODEL_LEGEND = {
+    int(MODEL_HYBRID_RISING): "hybrid rising",
+    int(MODEL_HYBRID_NONRISING): "hybrid non-rising",
+    int(MODEL_MONOEXP): "monoexp",
+    int(MODEL_GAMMA): "gamma",
+    int(MODEL_SINGLE_TIME_PHYS): "single-time phys",
+    int(MODEL_SINGLE_TIME_HAENSCHEID): "single-time haenscheid",
+    int(MODEL_SINGLE_TIME_PRIOR_HALF_LIFE): "single-time prior_half_life",
 }
 
 
@@ -68,6 +93,116 @@ def _chunk_slices(n: int, chunk: int) -> list[slice]:
     return out
 
 
+def _spawn_replicate_seeds(base_seed: int, n_replicates: int) -> list[int]:
+    return [
+        int(s.generate_state(1)[0]) for s in np.random.SeedSequence(base_seed).spawn(n_replicates)
+    ]
+
+
+def _assemble_output_images(
+    ref: Any,
+    idx: np.ndarray,
+    tia: np.ndarray,
+    r2: np.ndarray,
+    sigma_tia: np.ndarray,
+    model_id: np.ndarray,
+    status_id: np.ndarray,
+    tpeak: np.ndarray,
+) -> tuple[Any, Any, Any, Any, Any, Any | None, np.ndarray, np.ndarray]:
+    shape3 = ref.shape[:3]
+    tia_vol = np.full((np.prod(shape3),), np.nan, dtype=np.float32)
+    r2_vol = np.full_like(tia_vol, np.nan)
+    sig_vol = np.full_like(tia_vol, np.nan)
+    model_vol = np.zeros_like(tia_vol, dtype=np.uint8)
+    status_vol = np.zeros_like(tia_vol, dtype=np.uint8)
+    tpeak_vol = np.full_like(tia_vol, np.nan)
+
+    status_vol[:] = STATUS_OUTSIDE
+    tia_vol[idx] = tia
+    r2_vol[idx] = r2
+    sig_vol[idx] = sigma_tia
+    model_vol[idx] = model_id
+    status_vol[idx] = status_id
+    tpeak_vol[idx] = tpeak
+
+    tia_img = make_like(ref, tia_vol.reshape(shape3))
+    r2_img = make_like(ref, r2_vol.reshape(shape3))
+    sig_img = make_like(ref, sig_vol.reshape(shape3))
+    model_img = make_like(ref, model_vol.reshape(shape3).astype(np.uint8))
+    status_img = make_like(ref, status_vol.reshape(shape3).astype(np.uint8))
+    tpeak_img = (
+        make_like(ref, tpeak_vol.reshape(shape3)) if np.any(np.isfinite(tpeak_vol)) else None
+    )
+    return tia_img, r2_img, sig_img, model_img, status_img, tpeak_img, model_vol, status_vol
+
+
+def _save_output_images(
+    out_dir: Path,
+    prefix: str | None,
+    tia_img: Any,
+    r2_img: Any,
+    sig_img: Any,
+    model_img: Any,
+    status_img: Any,
+    tpeak_img: Any | None,
+) -> dict[str, Path]:
+    outputs: dict[str, Path] = {}
+    fn_tia = _out_name(prefix, "tia.nii.gz")
+    fn_r2 = _out_name(prefix, "r2.nii.gz")
+    fn_sig = _out_name(prefix, "sigma_tia.nii.gz")
+    fn_model = _out_name(prefix, "model_id.nii.gz")
+    fn_status = _out_name(prefix, "status_id.nii.gz")
+    fn_tpeak = _out_name(prefix, "tpeak.nii.gz")
+
+    nib.save(tia_img, str(out_dir / fn_tia))
+    outputs["tia"] = out_dir / fn_tia
+    nib.save(r2_img, str(out_dir / fn_r2))
+    outputs["r2"] = out_dir / fn_r2
+    nib.save(sig_img, str(out_dir / fn_sig))
+    outputs["sigma_tia"] = out_dir / fn_sig
+    nib.save(model_img, str(out_dir / fn_model))
+    outputs["model_id"] = out_dir / fn_model
+    nib.save(status_img, str(out_dir / fn_status))
+    outputs["status_id"] = out_dir / fn_status
+    if tpeak_img is not None:
+        nib.save(tpeak_img, str(out_dir / fn_tpeak))
+        outputs["tpeak"] = out_dir / fn_tpeak
+    return outputs
+
+
+def _build_summary(
+    cfg: dict[str, Any],
+    t_s: np.ndarray,
+    vml: float,
+    model_vol: np.ndarray,
+    status_vol: np.ndarray,
+    idx: np.ndarray,
+    timing_ms: dict[str, float],
+    enable_prof: bool,
+) -> dict[str, Any]:
+    status_counts = {
+        int(k): int(v)
+        for k, v in zip(*np.unique(status_vol[idx], return_counts=True), strict=False)
+    }
+    model_counts = {
+        int(k): int(v) for k, v in zip(*np.unique(model_vol[idx], return_counts=True), strict=False)
+    }
+    return {
+        "pytia_version": __version__,
+        "times_seconds": [float(x) for x in t_s.tolist()],
+        "voxel_volume_ml": float(vml),
+        "status_legend": STATUS_LEGEND,
+        "model_legend": MODEL_LEGEND,
+        "status_counts": {STATUS_LEGEND[int(k)]: int(v) for k, v in status_counts.items()},
+        "model_counts": {
+            MODEL_LEGEND.get(int(k), f"unknown model ({int(k)})"): int(v)
+            for k, v in model_counts.items()
+        },
+        "timing_ms": timing_ms if enable_prof else {},
+        "config": cfg,
+    }
+
+
 def run_tia(
     images: Sequence[str | Path | Any],
     times: Sequence[float],
@@ -78,42 +213,40 @@ def run_tia(
     Compute time-integrated activity (TIA) from activity images.
 
     Supports both multi-timepoint (dynamic) and single-timepoint (static) modes:
-    
+
     **Multi-timepoint mode** (T ≥ 2):
         - Fits exponential/gamma models to activity time-curves
         - Computes TIA via curve fitting and numerical integration
         - Supports 3 curve classes: rising, hump (gamma), falling (exponential)
         - Optionally applies physical decay tail extrapolation
-        
+
     **Single-timepoint mode** (T = 1, `single_time.enabled=True`):
         Computes TIA = A(t) / λ_eff using one of three methods:
-        
+
         1. **phys** (physical decay):
            Uses physical decay rate from radionuclide half-life.
            λ = ln(2) / half_life (from `physics.half_life_seconds`)
-           
+
         2. **haenscheid** (Hänscheid method):
            Uses effective half-life of tracer in human body.
            λ = ln(2) / eff_half_life (from `single_time.haenscheid_eff_half_life_seconds`,
            falls back to `physics.half_life_seconds`)
-           
+
         3. **prior_half_life** (prior segmentation-based):
            Supports global or label-map based half-life priors.
            - Global: λ = ln(2) / half_life (from `single_time.half_life_seconds`)
            - Label-based: λ per voxel from `single_time.label_half_lives` mapping,
              keyed by label from `single_time.label_map_path`
-    
+
     Args:
         images: Single image or sequence of images (NIfTI paths or nibabel objects)
         times: Timepoints in specified unit (one per image)
         config: Config dict, YAML path, or None (uses defaults)
         mask: Optional mask image (path or nibabel object)
-        
+
     Returns:
         Results object with TIA, R², sigma_TIA, model_id, status_id images and summary
     """
-    import time as _time
-
     t0_all = _time.perf_counter()
 
     cfg = Config.load(config).data
@@ -123,50 +256,81 @@ def run_tia(
     perf_cfg = cfg.get("performance", {})
     chunk_size = int(perf_cfg.get("chunk_size_vox", 0) or 0)
     enable_prof = bool(perf_cfg.get("enable_profiling", False))
+    low_memory_input = bool(perf_cfg.get("low_memory_input", False))
+    parallel_workers = int(perf_cfg.get("parallel_workers", 1) or 1)
+    parallel_bootstrap = bool(perf_cfg.get("parallel_bootstrap", False)) and parallel_workers > 1
 
     timing_ms: dict[str, float] = {}
 
     t0 = _time.perf_counter()
     imgs = load_images(images)
-    data4, ref = stack_4d(imgs)
-
     t_s = _times_to_seconds(times, cfg["time"]["unit"])
+    if len(t_s) != len(imgs):
+        raise ValueError(f"Number of times ({len(t_s)}) must match number of images ({len(imgs)}).")
     if cfg["time"].get("sort_timepoints", True):
         order = np.argsort(t_s)
         t_s = t_s[order]
-        data4 = data4[..., order]
+        imgs = [imgs[int(i)] for i in order]
+
+    ref = imgs[0]
+    shape3 = ref.shape[:3]
+    aff = ref.affine
+    for im in imgs[1:]:
+        if im.shape[:3] != shape3:
+            raise ValueError("All images must have same 3D shape.")
+        if not np.allclose(im.affine, aff):
+            raise ValueError("All images must have same affine.")
+    data4 = None
+    if not low_memory_input:
+        data4, _ = stack_4d(imgs)
     timing_ms["load_sort_ms"] = 1000.0 * (_time.perf_counter() - t0)
 
-    # Denoise + clamp negatives (in density space)
+    # Denoise + clamp negatives (density space), then convert to Bq and keep masked Aflat matrix.
     t0 = _time.perf_counter()
-    data4 = clamp_negative_to_zero(data4)
-    # Mask
+    vml = voxel_volume_ml(ref)
+    mmode = cfg["mask"]["mode"]
     if mask is not None:
         mimg = mask if not isinstance(mask, (str, Path)) else load_mask(mask)
-        mask3 = mask_to_bool(mimg, ref.shape[:3])
+        mask3 = mask_to_bool(mimg, shape3)
+    elif mmode == "none":
+        mask3 = np.ones(shape3, dtype=bool)
+    elif mmode == "provided":
+        mimg = load_mask(cfg["mask"]["provided_path"])
+        mask3 = mask_to_bool(mimg, shape3)
     else:
-        mmode = cfg["mask"]["mode"]
-        if mmode == "none":
-            mask3 = np.ones(ref.shape[:3], dtype=bool)
-        elif mmode == "provided":
-            mimg = load_mask(cfg["mask"]["provided_path"])
-            mask3 = mask_to_bool(mimg, ref.shape[:3])
+        if low_memory_input:
+            sum_vol = np.zeros(shape3, dtype=np.float32)
+            for im in imgs:
+                vol = clamp_negative_to_zero(np.asanyarray(im.dataobj).astype(np.float32))
+                sum_vol += vol
+            mask3 = make_body_mask(
+                sum_vol[..., None], min_fraction_of_max=cfg["mask"]["min_fraction_of_max"]
+            )
         else:
+            data4 = clamp_negative_to_zero(data4)
             mask3 = make_body_mask(data4, min_fraction_of_max=cfg["mask"]["min_fraction_of_max"])
 
-    if cfg["denoise"]["enabled"]:
-        data4 = masked_gaussian(data4, mask3, sigma_vox=float(cfg["denoise"]["sigma_vox"]))
-        data4 = clamp_negative_to_zero(data4)
-    timing_ms["mask_denoise_ms"] = 1000.0 * (_time.perf_counter() - t0)
-
-    # Convert to Bq per voxel
-    vml = voxel_volume_ml(ref)
-    A4 = (data4 * vml).astype(np.float32)
-
-    # Flatten masked voxels
     idx = np.where(mask3.ravel())[0]
     n_vox = idx.size
-    T = A4.shape[-1]
+    T = len(imgs)
+    Aflat_masked = np.zeros((n_vox, T), dtype=np.float32)
+
+    if low_memory_input:
+        for j, im in enumerate(imgs):
+            vol = clamp_negative_to_zero(np.asanyarray(im.dataobj).astype(np.float32))
+            if cfg["denoise"]["enabled"]:
+                vol = masked_gaussian(
+                    vol[..., None], mask3, sigma_vox=float(cfg["denoise"]["sigma_vox"])
+                )[..., 0]
+                vol = clamp_negative_to_zero(vol)
+            Aflat_masked[:, j] = vol.reshape(-1)[idx] * vml
+    else:
+        data4 = clamp_negative_to_zero(data4)
+        if cfg["denoise"]["enabled"]:
+            data4 = masked_gaussian(data4, mask3, sigma_vox=float(cfg["denoise"]["sigma_vox"]))
+            data4 = clamp_negative_to_zero(data4)
+        Aflat_masked = (data4.reshape((-1, T))[idx, :] * vml).astype(np.float32)
+    timing_ms["mask_denoise_ms"] = 1000.0 * (_time.perf_counter() - t0)
 
     # Physics
     hl = cfg["physics"]["half_life_seconds"]
@@ -184,15 +348,15 @@ def run_tia(
     tpeak = np.full((n_vox,), np.nan, dtype=np.float32)
 
     # Single-timepoint (STP) handling
-    # When single image is provided with STP enabled, compute TIA = A(t) / λ_eff
-    # using one of three methods: phys (physical), haenscheid (effective), or prior_half_life (segmentation-prior)
+    # For T=1 and STP enabled, compute TIA=A(t)/lambda_eff using phys/haenscheid/prior methods.
     st_cfg = cfg.get("single_time", {})
     if T == 1 and bool(st_cfg.get("enabled", False)):
         t0 = _time.perf_counter()
         method = (st_cfg.get("method", "phys") or "phys").lower()
+        model_code = 0
 
         # Extract activity values for masked voxels (shape: n_vox,)
-        Aflat = A4.reshape((-1, T))[idx, 0].astype(np.float32)
+        Aflat = Aflat_masked[:, 0].astype(np.float32)
 
         # Apply noise-floor filtering (same as multi-timepoint)
         nf_cfg = cfg["noise_floor"]
@@ -220,34 +384,43 @@ def run_tia(
                 status_id[~all_below] = STATUS_FIT_FAILED
             else:
                 lambda_eff[:] = float(lambda_phys)
-                model_code = 101
+                model_code = MODEL_SINGLE_TIME_PHYS
 
-        elif method == "haenscheid" or method == "hanscheid":
+        elif method in {"haenscheid", "hanscheid"}:
             # Method 2: Hänscheid method using effective half-life in human body
             # Falls back to physics.half_life_seconds if explicit effective HL not provided
-            eff_hl = st_cfg.get("haenscheid_eff_half_life_seconds") or cfg["physics"].get("half_life_seconds")
+            eff_hl = st_cfg.get("haenscheid_eff_half_life_seconds") or cfg["physics"].get(
+                "half_life_seconds"
+            )
             if eff_hl is None:
                 status_id[~all_below] = STATUS_FIT_FAILED
             else:
                 lambda_eff[:] = float(np.log(2.0) / float(eff_hl))
-                model_code = 102
+                model_code = MODEL_SINGLE_TIME_HAENSCHEID
 
-        elif method == "prior_half_life" or method == "prior":
+        elif method in {"prior_half_life", "prior"}:
             # Method 3: Prior segmentation-based half-lives
             # Supports both global and label-map based mapping
             if st_cfg.get("label_map_path"):
                 # Label-map mode: map voxel label -> half-life value
                 lab_img = load_mask(st_cfg["label_map_path"])
                 labs = np.asanyarray(lab_img.dataobj).reshape(-1)[idx].astype(np.int32)
-                mapping = {int(k): float(v) for k, v in (st_cfg.get("label_half_lives") or {}).items()}
+                mapping = {
+                    int(k): float(v) for k, v in (st_cfg.get("label_half_lives") or {}).items()
+                }
                 default_hl = st_cfg.get("half_life_seconds")
-                for i, lab in enumerate(labs):
-                    hl_val = mapping.get(int(lab), default_hl)
-                    if hl_val is None:
-                        lambda_eff[i] = np.nan
-                    else:
-                        lambda_eff[i] = float(np.log(2.0) / float(hl_val))
-                model_code = 103
+                default_lambda = (
+                    np.nan if default_hl is None else float(np.log(2.0) / float(default_hl))
+                )
+                lambda_eff[:] = default_lambda
+
+                if mapping:
+                    map_labels = np.fromiter(mapping.keys(), dtype=np.int32)
+                    map_hl = np.fromiter(mapping.values(), dtype=np.float32)
+                    map_lambda = (np.log(2.0) / map_hl).astype(np.float32)
+                    for lab, lam in zip(map_labels, map_lambda, strict=False):
+                        lambda_eff[labs == lab] = lam
+                model_code = MODEL_SINGLE_TIME_PRIOR_HALF_LIFE
             else:
                 # Global mode: same half-life for all voxels
                 hl_val = st_cfg.get("half_life_seconds")
@@ -255,7 +428,7 @@ def run_tia(
                     status_id[~all_below] = STATUS_FIT_FAILED
                 else:
                     lambda_eff[:] = float(np.log(2.0) / float(hl_val))
-                    model_code = 103
+                    model_code = MODEL_SINGLE_TIME_PRIOR_HALF_LIFE
         else:
             status_id[~all_below] = STATUS_FIT_FAILED
 
@@ -265,7 +438,8 @@ def run_tia(
         tia_vals[ok] = (Aflat[ok] / lambda_eff[ok]).astype(np.float32)
 
         tia[:] = tia_vals
-        model_id[ok] = np.uint8(model_code if "model_code" in locals() else 0)
+        if model_code:
+            model_id[ok] = np.uint8(model_code)
         # mark invalid voxels
         bad = ~ok & ~all_below
         status_id[bad] = STATUS_NOT_APPLICABLE_INSUFFICIENT_POINTS
@@ -274,59 +448,37 @@ def run_tia(
 
         # Unflatten to volumes and save (reuse same behaviour as multi-timepoint)
         t0 = _time.perf_counter()
-        shape3 = ref.shape[:3]
-        tia_vol = np.full((np.prod(shape3),), np.nan, dtype=np.float32)
-        r2_vol = np.full_like(tia_vol, np.nan)
-        sig_vol = np.full_like(tia_vol, np.nan)
-        model_vol = np.zeros_like(tia_vol, dtype=np.uint8)
-        status_vol = np.zeros_like(tia_vol, dtype=np.uint8)
-        tpeak_vol = np.full_like(tia_vol, np.nan)
-
-        status_vol[:] = STATUS_OUTSIDE
-        tia_vol[idx] = tia
-        r2_vol[idx] = r2
-        sig_vol[idx] = sigma_tia
-        model_vol[idx] = model_id
-        status_vol[idx] = status_id
-        tpeak_vol[idx] = tpeak
-
-        tia_img = make_like(ref, tia_vol.reshape(shape3))
-        r2_img = make_like(ref, r2_vol.reshape(shape3))
-        sig_img = make_like(ref, sig_vol.reshape(shape3))
-        model_img = make_like(ref, model_vol.reshape(shape3).astype(np.uint8))
-        status_img = make_like(ref, status_vol.reshape(shape3).astype(np.uint8))
+        (
+            tia_img,
+            r2_img,
+            sig_img,
+            model_img,
+            status_img,
+            _,
+            model_vol,
+            status_vol,
+        ) = _assemble_output_images(ref, idx, tia, r2, sigma_tia, model_id, status_id, tpeak)
         tpeak_img = None
         timing_ms["assemble_ms"] = 1000.0 * (_time.perf_counter() - t0)
 
         # Save outputs
         t0 = _time.perf_counter()
-        outputs: dict[str, Path] = {}
-        import nibabel as nib  # local import
-
-        fn_tia = _out_name(prefix, "tia.nii.gz")
-        fn_r2 = _out_name(prefix, "r2.nii.gz")
-        fn_sig = _out_name(prefix, "sigma_tia.nii.gz")
-        fn_model = _out_name(prefix, "model_id.nii.gz")
-        fn_status = _out_name(prefix, "status_id.nii.gz")
-
-        nib.save(tia_img, str(out_dir / fn_tia)); outputs["tia"] = out_dir / fn_tia
-        nib.save(r2_img, str(out_dir / fn_r2)); outputs["r2"] = out_dir / fn_r2
-        nib.save(sig_img, str(out_dir / fn_sig)); outputs["sigma_tia"] = out_dir / fn_sig
-        nib.save(model_img, str(out_dir / fn_model)); outputs["model_id"] = out_dir / fn_model
-        nib.save(status_img, str(out_dir / fn_status)); outputs["status_id"] = out_dir / fn_status
+        outputs = _save_output_images(
+            out_dir, prefix, tia_img, r2_img, sig_img, model_img, status_img, None
+        )
         timing_ms["save_ms"] = 1000.0 * (_time.perf_counter() - t0)
 
         # Summary and return
-        status_counts = {int(k): int(v) for k, v in zip(*np.unique(status_vol[idx], return_counts=True))}
-        summary = {
-            "pytia_version": "0.1.0",
-            "times_seconds": [float(x) for x in t_s.tolist()],
-            "voxel_volume_ml": float(vml),
-            "status_legend": STATUS_LEGEND,
-            "status_counts": {STATUS_LEGEND[int(k)]: int(v) for k, v in status_counts.items()},
-            "timing_ms": timing_ms,
-            "config": cfg,
-        }
+        summary = _build_summary(
+            cfg=cfg,
+            t_s=t_s,
+            vml=float(vml),
+            model_vol=model_vol,
+            status_vol=status_vol,
+            idx=idx,
+            timing_ms=timing_ms,
+            enable_prof=enable_prof,
+        )
         if io_cfg.get("write_summary_yaml", True):
             outputs["summary"] = _save_summary(out_dir, prefix, summary)
 
@@ -359,7 +511,7 @@ def run_tia(
             raise ValueError("regions.enabled is true but regions.classes is empty.")
 
         # Build full A and valid once (region operations need grouped data)
-        A = A4.reshape((-1, T))[idx, :]  # (N_vox, T)
+        A = Aflat_masked  # (N_vox, T)
         nf_cfg = cfg["noise_floor"]
         if nf_cfg["enabled"]:
             floor = compute_noise_floor(
@@ -399,24 +551,34 @@ def run_tia(
             allowed = [m.lower() for m in region_def.get("allowed_models", [])]
 
             # Mean TAC in Bq
-            Areg = np.nanmean(np.where(valid[vox_mask], A[vox_mask], np.nan), axis=0).astype(np.float32)
+            Areg = np.nanmean(np.where(valid[vox_mask], A[vox_mask], np.nan), axis=0).astype(
+                np.float32
+            )
             valid_reg = np.isfinite(Areg) & (Areg > 0)
             if np.sum(valid_reg) < 2:
                 status_id[vox_mask] = STATUS_NOT_APPLICABLE_INSUFFICIENT_POINTS
                 continue
 
             # Fit region
-            if region_class == "hump" and (default_model in (None, "gamma")) and ("gamma" in allowed or not allowed):
+            if (
+                region_class == "hump"
+                and (default_model in (None, "gamma"))
+                and ("gamma" in allowed or not allowed)
+            ):
                 if np.any(t_s <= 0):
                     # cannot do gamma linear if t includes 0
                     if lambda_phys is None:
                         status_id[vox_mask] = STATUS_FIT_FAILED
                         continue
                     tia_reg_arr, Ahat_reg2, r2_reg = tia_trapz_plus_phys_tail(
-                        Areg[None, :], t_s, valid_reg[None, :], lambda_phys=lambda_phys, include_t0=True
+                        Areg[None, :],
+                        t_s,
+                        valid_reg[None, :],
+                        lambda_phys=lambda_phys,
+                        include_t0=True,
                     )
                     tia_reg = float(tia_reg_arr[0])
-                    region_model_id = 11
+                    region_model_id = MODEL_HYBRID_NONRISING
                     region_tpeak = np.nan
                     region_r2 = float(r2_reg[0])
                     Ahat_reg = Ahat_reg2.astype(np.float32)
@@ -425,18 +587,28 @@ def run_tia(
                         Areg[None, :], t_s, valid_reg[None, :], lambda_phys=lambda_phys
                     )
                     tia_reg = float(tia_from_gamma_params(params)[0])
-                    region_model_id = 30
+                    region_model_id = MODEL_GAMMA
                     region_tpeak = float(tpk[0])
                     region_r2 = float(r2_reg[0])
-            elif region_class == "falling" and (default_model in (None, "exp")) and ("exp" in allowed or not allowed):
+            elif (
+                region_class == "falling"
+                and (default_model in (None, "exp"))
+                and ("exp" in allowed or not allowed)
+            ):
                 peak_index = np.array([int(np.argmax(valid_reg))], dtype=np.int64)
                 lam, Ahat_reg, r2_reg = fit_monoexp_tail(
-                    Areg[None, :], t_s, valid_reg[None, :], lambda_phys=lambda_phys, peak_index=peak_index
+                    Areg[None, :],
+                    t_s,
+                    valid_reg[None, :],
+                    lambda_phys=lambda_phys,
+                    peak_index=peak_index,
                 )
                 tia_reg = float(
-                    tia_monoexp_with_triangle_uptake(Areg[None, :], t_s, valid_reg[None, :], lam, peak_index)[0]
+                    tia_monoexp_with_triangle_uptake(
+                        Areg[None, :], t_s, valid_reg[None, :], lam, peak_index
+                    )[0]
                 )
-                region_model_id = 20
+                region_model_id = MODEL_MONOEXP
                 region_tpeak = float(t_s[peak_index[0]])
                 region_r2 = float(r2_reg[0])
             else:
@@ -447,7 +619,9 @@ def run_tia(
                     Areg[None, :], t_s, valid_reg[None, :], lambda_phys=lambda_phys, include_t0=True
                 )
                 tia_reg = float(tia_reg_arr[0])
-                region_model_id = 10 if region_class == "rising" else 11
+                region_model_id = (
+                    MODEL_HYBRID_RISING if region_class == "rising" else MODEL_HYBRID_NONRISING
+                )
                 region_tpeak = np.nan
                 region_r2 = float(r2_reg[0])
 
@@ -490,52 +664,85 @@ def run_tia(
 
             # voxels without valid tref become not applicable
             bad = ~vref_ok
-            status_id[vox_mask] = np.where(bad, STATUS_NOT_APPLICABLE_INSUFFICIENT_POINTS, STATUS_OK).astype(
-                np.uint8
-            )
+            status_id[vox_mask] = np.where(
+                bad, STATUS_NOT_APPLICABLE_INSUFFICIENT_POINTS, STATUS_OK
+            ).astype(np.uint8)
 
-            # Bootstrap in region mode: refit region per replicate, fixed class; scale sigma by voxel scale
+            # Region-mode bootstrap: refit region per replicate, then scale sigma by voxel scale.
             if cfg["bootstrap"]["enabled"]:
-                rng = np.random.default_rng(int(cfg["bootstrap"]["seed"]) + int(lab) * 17)
                 B = int(cfg["bootstrap"]["n"])
+                base_seed = int(cfg["bootstrap"]["seed"]) + int(lab) * 17
+                rep_seeds = _spawn_replicate_seeds(base_seed, B)
 
                 # residual bootstrap needs baseline Ahat_reg for region
                 Ahat_reg0 = Ahat_reg.astype(np.float32)
-                tia_bs = np.full((B,), np.nan, dtype=np.float32)
 
-                for b in range(B):
+                def _region_bootstrap_tia(
+                    seed: int,
+                    Areg_local: np.ndarray = Areg,
+                    Ahat_reg0_local: np.ndarray = Ahat_reg0,
+                    valid_reg_local: np.ndarray = valid_reg,
+                    region_model_id_local: int = region_model_id,
+                    t_s_local: np.ndarray = t_s,
+                    lambda_phys_local: float | None = lambda_phys,
+                ) -> float:
+                    rng = np.random.default_rng(seed)
                     Astar = residual_bootstrap(
-                        Areg[None, :], Ahat_reg0, valid_reg[None, :], rng=rng
+                        Areg_local[None, :],
+                        Ahat_reg0_local,
+                        valid_reg_local[None, :],
+                        rng=rng,
                     )[0]
                     valid_star = np.isfinite(Astar) & (Astar > 0)
                     if np.sum(valid_star) < 2:
-                        continue
+                        return np.nan
 
-                    try:
-                        if region_model_id == 30:
-                            params_s, _, _, _ = fit_gamma_linear_wls(
-                                Astar[None, :], t_s, valid_star[None, :], lambda_phys=lambda_phys
-                            )
-                            tia_bs[b] = float(tia_from_gamma_params(params_s)[0])
-                        elif region_model_id == 20:
-                            peak_index = np.array([int(np.argmax(valid_star))], dtype=np.int64)
-                            lam_s, _, _ = fit_monoexp_tail(
-                                Astar[None, :], t_s, valid_star[None, :], lambda_phys=lambda_phys, peak_index=peak_index
-                            )
-                            tia_bs[b] = float(
-                                tia_monoexp_with_triangle_uptake(
-                                    Astar[None, :], t_s, valid_star[None, :], lam_s, peak_index
-                                )[0]
-                            )
-                        else:
-                            if lambda_phys is None:
-                                continue
-                            tia_s, _, _ = tia_trapz_plus_phys_tail(
-                                Astar[None, :], t_s, valid_star[None, :], lambda_phys=lambda_phys, include_t0=True
-                            )
-                            tia_bs[b] = float(tia_s[0])
-                    except Exception:
-                        continue
+                    if region_model_id_local == MODEL_GAMMA:
+                        params_s, _, _, _ = fit_gamma_linear_wls(
+                            Astar[None, :],
+                            t_s_local,
+                            valid_star[None, :],
+                            lambda_phys=lambda_phys_local,
+                        )
+                        return float(tia_from_gamma_params(params_s)[0])
+                    if region_model_id_local == MODEL_MONOEXP:
+                        peak_index = np.array([int(np.argmax(valid_star))], dtype=np.int64)
+                        lam_s, _, _ = fit_monoexp_tail(
+                            Astar[None, :],
+                            t_s_local,
+                            valid_star[None, :],
+                            lambda_phys=lambda_phys_local,
+                            peak_index=peak_index,
+                        )
+                        return float(
+                            tia_monoexp_with_triangle_uptake(
+                                Astar[None, :],
+                                t_s_local,
+                                valid_star[None, :],
+                                lam_s,
+                                peak_index,
+                            )[0]
+                        )
+                    if lambda_phys_local is None:
+                        return np.nan
+                    tia_s, _, _ = tia_trapz_plus_phys_tail(
+                        Astar[None, :],
+                        t_s_local,
+                        valid_star[None, :],
+                        lambda_phys=lambda_phys_local,
+                        include_t0=True,
+                    )
+                    return float(tia_s[0])
+
+                if parallel_bootstrap:
+                    with ThreadPoolExecutor(max_workers=parallel_workers) as ex:
+                        tia_bs = np.asarray(
+                            list(ex.map(_region_bootstrap_tia, rep_seeds)), dtype=np.float32
+                        )
+                else:
+                    tia_bs = np.asarray(
+                        [_region_bootstrap_tia(seed) for seed in rep_seeds], dtype=np.float32
+                    )
 
                 if np.any(np.isfinite(tia_bs)):
                     reg_sigma = float(np.nanstd(tia_bs, ddof=1))
@@ -550,10 +757,7 @@ def run_tia(
         nf_cfg = cfg["noise_floor"]
         slices = _chunk_slices(n_vox, chunk_size)
 
-        # We need A4 flattened once; but we slice idx chunk-wise to avoid allocating A for all voxels at once.
-        Aflat = A4.reshape((-1, T))
-
-        # For bootstrap, we will store baseline Ahat0 and valid0 across all voxels; in chunking mode,
+        # For bootstrap, store baseline Ahat0 and valid0 for all voxels; in chunking mode,
         # we compute Ahat0 per chunk and store (N_vox,T) only if bootstrap enabled.
         do_boot = bool(cfg["bootstrap"]["enabled"])
         Ahat0_all = np.full((n_vox, T), np.nan, dtype=np.float32) if do_boot else None
@@ -561,8 +765,7 @@ def run_tia(
         cls_all = np.zeros((n_vox,), dtype=np.uint8) if do_boot else None
 
         for sl in slices:
-            vox_idx = idx[sl]
-            A = Aflat[vox_idx, :].astype(np.float32)  # (Nc,T)
+            A = Aflat_masked[sl, :].astype(np.float32)  # (Nc,T)
 
             # noise floor validity
             if nf_cfg["enabled"]:
@@ -597,7 +800,12 @@ def run_tia(
             model_c = np.zeros((A.shape[0],), dtype=np.uint8)
             tpeak_c = np.full((A.shape[0],), np.nan, dtype=np.float32)
 
-            hump = (cls == CLASS_HUMP) & (n_valid >= int(cfg["model_selection"]["min_points_for_gamma"])) & (~insufficient) & (~all_below)
+            hump = (
+                (cls == CLASS_HUMP)
+                & (n_valid >= int(cfg["model_selection"]["min_points_for_gamma"]))
+                & (~insufficient)
+                & (~all_below)
+            )
             if np.any(hump):
                 # gamma linear requires t>0
                 if np.any(t_s <= 0):
@@ -605,32 +813,48 @@ def run_tia(
                     hump2 = hump.copy()
                     hump[:] = False
                 else:
-                    params, tpk, Ahat, r2_h = fit_gamma_linear_wls(A[hump], t_s, valid[hump], lambda_phys=lambda_phys)
+                    params, tpk, Ahat, r2_h = fit_gamma_linear_wls(
+                        A[hump, :], t_s, valid[hump, :], lambda_phys=lambda_phys
+                    )
                     tia_h = tia_from_gamma_params(params)
                     tia_c[hump] = tia_h
                     r2_c[hump] = r2_h
                     tpeak_c[hump] = tpk
-                    model_c[hump] = 30
+                    model_c[hump] = MODEL_GAMMA
                     if do_boot:
-                        Ahat0_all[sl][hump] = Ahat
+                        chunk_idx = np.where(hump)[0] + sl.start
+                        Ahat0_all[chunk_idx, :] = Ahat
 
             falling = (cls == CLASS_FALLING) & (~insufficient) & (~all_below)
             if np.any(falling):
                 lam, Ahat, r2_f = fit_monoexp_tail(
-                    A[falling], t_s, valid[falling], lambda_phys=lambda_phys, peak_index=peak_index[falling]
+                    A[falling, :],
+                    t_s,
+                    valid[falling, :],
+                    lambda_phys=lambda_phys,
+                    peak_index=peak_index[falling],
                 )
-                tia_f = tia_monoexp_with_triangle_uptake(A[falling], t_s, valid[falling], lam, peak_index[falling])
+                tia_f = tia_monoexp_with_triangle_uptake(
+                    A[falling, :],
+                    t_s,
+                    valid[falling, :],
+                    lam,
+                    peak_index[falling],
+                )
                 tia_c[falling] = tia_f
                 r2_c[falling] = r2_f
                 tpeak_c[falling] = np.take_along_axis(
                     t_s[None, :], peak_index[falling][:, None], axis=1
                 )[:, 0].astype(np.float32)
-                model_c[falling] = 20
+                model_c[falling] = MODEL_MONOEXP
                 if do_boot:
-                    Ahat0_all[sl][falling] = Ahat
+                    chunk_idx = np.where(falling)[0] + sl.start
+                    Ahat0_all[chunk_idx, :] = Ahat
 
             # Hybrid for rising + ambiguous + gamma fallback (if times<=0)
-            hybrid_mask = ((cls == CLASS_RISING) | (cls == 4)) & (~insufficient) & (~all_below)
+            hybrid_mask = (
+                ((cls == CLASS_RISING) | (cls == CLASS_AMBIG)) & (~insufficient) & (~all_below)
+            )
             if "hump2" in locals() and np.any(hump2):
                 hybrid_mask = hybrid_mask | hump2
 
@@ -639,17 +863,28 @@ def run_tia(
                     status[hybrid_mask] = STATUS_FIT_FAILED
                 else:
                     tia_hy, _, _ = tia_trapz_plus_phys_tail(
-                        A[hybrid_mask], t_s, valid[hybrid_mask], lambda_phys=lambda_phys, include_t0=True
+                        A[hybrid_mask],
+                        t_s,
+                        valid[hybrid_mask],
+                        lambda_phys=lambda_phys,
+                        include_t0=True,
                     )
                     # Improved R2: compute Ahat piecewise at samples
-                    Ahat_hy = hybrid_piecewise_hat_at_samples(A[hybrid_mask], valid[hybrid_mask], t_s)
+                    Ahat_hy = hybrid_piecewise_hat_at_samples(
+                        A[hybrid_mask], valid[hybrid_mask], t_s
+                    )
                     r2_hy = r2_score(A[hybrid_mask], Ahat_hy, valid[hybrid_mask])
 
                     tia_c[hybrid_mask] = tia_hy
                     r2_c[hybrid_mask] = r2_hy
-                    model_c[hybrid_mask] = np.where(cls[hybrid_mask] == CLASS_RISING, 10, 11).astype(np.uint8)
+                    model_c[hybrid_mask] = np.where(
+                        cls[hybrid_mask] == CLASS_RISING,
+                        MODEL_HYBRID_RISING,
+                        MODEL_HYBRID_NONRISING,
+                    ).astype(np.uint8)
                     if do_boot:
-                        Ahat0_all[sl][hybrid_mask] = Ahat_hy
+                        chunk_idx = np.where(hybrid_mask)[0] + sl.start
+                        Ahat0_all[chunk_idx, :] = Ahat_hy
 
             # mark remaining NaN as fit failed
             bad_fit = (~insufficient) & (~all_below) & (~np.isfinite(tia_c))
@@ -672,124 +907,135 @@ def run_tia(
         if do_boot:
             t0 = _time.perf_counter()
             B = int(cfg["bootstrap"]["n"])
-            rng = np.random.default_rng(int(cfg["bootstrap"]["seed"]))
             reclass = bool(cfg["bootstrap"]["reclassify_each_replicate"])
-            # compute A once for bootstrap (inevitable for resampling); if too big, can chunk-bootstrap later.
-            A_all = Aflat[idx, :].astype(np.float32)
+            base_seed = int(cfg["bootstrap"]["seed"])
+            rep_seeds = _spawn_replicate_seeds(base_seed, B)
+            mean = np.zeros((n_vox,), dtype=np.float64)
+            m2 = np.zeros((n_vox,), dtype=np.float64)
+            count = np.zeros((n_vox,), dtype=np.int32)
 
-            tias = np.full((B, n_vox), np.nan, dtype=np.float32)
-            for b in range(B):
-                Astar = residual_bootstrap(A_all, Ahat0_all, valid_all, rng=rng).astype(np.float32)
-
-                if nf_cfg["enabled"]:
-                    floor_b = compute_noise_floor(
-                        Astar,
-                        mode=nf_cfg["mode"],
-                        absolute=float(nf_cfg["absolute_bq_per_ml"] * vml),
-                        rel_frac=float(nf_cfg["relative_fraction_of_voxel_max"]),
-                    )
-                    valid_b = valid_mask_from_floor(Astar, floor_b)
-                else:
-                    valid_b = np.isfinite(Astar)
-
-                n_valid_b = np.sum(valid_b, axis=1)
-                ok_b = n_valid_b >= 2
-
-                cls_b = classify_curves(Astar, valid_b) if reclass else cls_all
-
+            def _bootstrap_replicate(seed: int) -> np.ndarray:
+                rng = np.random.default_rng(seed)
                 tia_b = np.full((n_vox,), np.nan, dtype=np.float32)
+                for sl in slices:
+                    A_chunk = Aflat_masked[sl, :].astype(np.float32)
+                    Astar = residual_bootstrap(
+                        A_chunk, Ahat0_all[sl], valid_all[sl], rng=rng
+                    ).astype(np.float32)
 
-                hump_b = (cls_b == CLASS_HUMP) & ok_b & (n_valid_b >= int(cfg["model_selection"]["min_points_for_gamma"]))
-                if np.any(hump_b) and not np.any(t_s <= 0):
-                    try:
+                    if nf_cfg["enabled"]:
+                        floor_b = compute_noise_floor(
+                            Astar,
+                            mode=nf_cfg["mode"],
+                            absolute=float(nf_cfg["absolute_bq_per_ml"] * vml),
+                            rel_frac=float(nf_cfg["relative_fraction_of_voxel_max"]),
+                        )
+                        valid_b = valid_mask_from_floor(Astar, floor_b)
+                    else:
+                        valid_b = np.isfinite(Astar)
+
+                    n_valid_b = np.sum(valid_b, axis=1)
+                    ok_b = n_valid_b >= 2
+                    cls_b = classify_curves(Astar, valid_b) if reclass else cls_all[sl]
+
+                    tia_chunk = np.full((Astar.shape[0],), np.nan, dtype=np.float32)
+                    hump_b = (
+                        (cls_b == CLASS_HUMP)
+                        & ok_b
+                        & (n_valid_b >= int(cfg["model_selection"]["min_points_for_gamma"]))
+                    )
+                    if np.any(hump_b) and not np.any(t_s <= 0):
                         params_b, _, _, _ = fit_gamma_linear_wls(
                             Astar[hump_b], t_s, valid_b[hump_b], lambda_phys=lambda_phys
                         )
-                        tia_b[hump_b] = tia_from_gamma_params(params_b)
-                    except Exception:
-                        pass
+                        tia_chunk[hump_b] = tia_from_gamma_params(params_b)
 
-                falling_b = (cls_b == CLASS_FALLING) & ok_b
-                if np.any(falling_b):
-                    A_for_peak_b = np.where(valid_b, Astar, -np.inf)
-                    peak_b = np.argmax(A_for_peak_b, axis=1).astype(np.int64)
-                    lam_b, _, _ = fit_monoexp_tail(
-                        Astar[falling_b], t_s, valid_b[falling_b], lambda_phys=lambda_phys, peak_index=peak_b[falling_b]
-                    )
-                    tia_b[falling_b] = tia_monoexp_with_triangle_uptake(
-                        Astar[falling_b], t_s, valid_b[falling_b], lam_b, peak_b[falling_b]
-                    )
+                    falling_b = (cls_b == CLASS_FALLING) & ok_b
+                    if np.any(falling_b):
+                        A_for_peak_b = np.where(valid_b, Astar, -np.inf)
+                        peak_b = np.argmax(A_for_peak_b, axis=1).astype(np.int64)
+                        lam_b, _, _ = fit_monoexp_tail(
+                            Astar[falling_b],
+                            t_s,
+                            valid_b[falling_b],
+                            lambda_phys=lambda_phys,
+                            peak_index=peak_b[falling_b],
+                        )
+                        tia_chunk[falling_b] = tia_monoexp_with_triangle_uptake(
+                            Astar[falling_b], t_s, valid_b[falling_b], lam_b, peak_b[falling_b]
+                        )
 
-                hybrid_b = ((cls_b == CLASS_RISING) | (cls_b == 4)) & ok_b
-                if np.any(hybrid_b) and lambda_phys is not None:
-                    tia_hyb, _, _ = tia_trapz_plus_phys_tail(
-                        Astar[hybrid_b], t_s, valid_b[hybrid_b], lambda_phys=lambda_phys, include_t0=True
-                    )
-                    tia_b[hybrid_b] = tia_hyb
+                    hybrid_b = ((cls_b == CLASS_RISING) | (cls_b == CLASS_AMBIG)) & ok_b
+                    if np.any(hybrid_b) and lambda_phys is not None:
+                        tia_hyb, _, _ = tia_trapz_plus_phys_tail(
+                            Astar[hybrid_b],
+                            t_s,
+                            valid_b[hybrid_b],
+                            lambda_phys=lambda_phys,
+                            include_t0=True,
+                        )
+                        tia_chunk[hybrid_b] = tia_hyb
 
-                tias[b] = tia_b
+                    tia_b[sl] = tia_chunk
+                return tia_b
 
-            sigma_tia[:] = np.nanstd(tias, axis=0, ddof=1).astype(np.float32)
+            if parallel_bootstrap:
+                with ThreadPoolExecutor(max_workers=parallel_workers) as ex:
+                    rep_results = ex.map(_bootstrap_replicate, rep_seeds)
+                    for tia_b in rep_results:
+                        finite = np.isfinite(tia_b)
+                        if np.any(finite):
+                            x = tia_b[finite].astype(np.float64)
+                            c = count[finite] + 1
+                            delta = x - mean[finite]
+                            mean[finite] += delta / c
+                            delta2 = x - mean[finite]
+                            m2[finite] += delta * delta2
+                            count[finite] = c
+            else:
+                for seed in rep_seeds:
+                    tia_b = _bootstrap_replicate(seed)
+                    finite = np.isfinite(tia_b)
+                    if np.any(finite):
+                        x = tia_b[finite].astype(np.float64)
+                        c = count[finite] + 1
+                        delta = x - mean[finite]
+                        mean[finite] += delta / c
+                        delta2 = x - mean[finite]
+                        m2[finite] += delta * delta2
+                        count[finite] = c
+
+            sigma = np.full((n_vox,), np.nan, dtype=np.float64)
+            enough = count > 1
+            sigma[enough] = np.sqrt(m2[enough] / (count[enough] - 1))
+            sigma_tia[:] = sigma.astype(np.float32)
             timing_ms["bootstrap_ms"] = 1000.0 * (_time.perf_counter() - t0)
 
     # Unflatten to volumes
     t0 = _time.perf_counter()
-    shape3 = ref.shape[:3]
-    tia_vol = np.full((np.prod(shape3),), np.nan, dtype=np.float32)
-    r2_vol = np.full_like(tia_vol, np.nan)
-    sig_vol = np.full_like(tia_vol, np.nan)
-    model_vol = np.zeros_like(tia_vol, dtype=np.uint8)
-    status_vol = np.zeros_like(tia_vol, dtype=np.uint8)
-    tpeak_vol = np.full_like(tia_vol, np.nan)
-
-    status_vol[:] = STATUS_OUTSIDE
-    tia_vol[idx] = tia
-    r2_vol[idx] = r2
-    sig_vol[idx] = sigma_tia
-    model_vol[idx] = model_id
-    status_vol[idx] = status_id
-    tpeak_vol[idx] = tpeak
-
-    tia_img = make_like(ref, tia_vol.reshape(shape3))
-    r2_img = make_like(ref, r2_vol.reshape(shape3))
-    sig_img = make_like(ref, sig_vol.reshape(shape3))
-    model_img = make_like(ref, model_vol.reshape(shape3).astype(np.uint8))
-    status_img = make_like(ref, status_vol.reshape(shape3).astype(np.uint8))
-    tpeak_img = make_like(ref, tpeak_vol.reshape(shape3)) if np.any(np.isfinite(tpeak_vol)) else None
+    tia_img, r2_img, sig_img, model_img, status_img, tpeak_img, model_vol, status_vol = (
+        _assemble_output_images(ref, idx, tia, r2, sigma_tia, model_id, status_id, tpeak)
+    )
     timing_ms["assemble_ms"] = 1000.0 * (_time.perf_counter() - t0)
 
     # Save outputs
     t0 = _time.perf_counter()
-    outputs: dict[str, Path] = {}
-    import nibabel as nib  # local import
-
-    fn_tia = _out_name(prefix, "tia.nii.gz")
-    fn_r2 = _out_name(prefix, "r2.nii.gz")
-    fn_sig = _out_name(prefix, "sigma_tia.nii.gz")
-    fn_model = _out_name(prefix, "model_id.nii.gz")
-    fn_status = _out_name(prefix, "status_id.nii.gz")
-    fn_tpeak = _out_name(prefix, "tpeak.nii.gz")
-
-    nib.save(tia_img, str(out_dir / fn_tia)); outputs["tia"] = out_dir / fn_tia
-    nib.save(r2_img, str(out_dir / fn_r2)); outputs["r2"] = out_dir / fn_r2
-    nib.save(sig_img, str(out_dir / fn_sig)); outputs["sigma_tia"] = out_dir / fn_sig
-    nib.save(model_img, str(out_dir / fn_model)); outputs["model_id"] = out_dir / fn_model
-    nib.save(status_img, str(out_dir / fn_status)); outputs["status_id"] = out_dir / fn_status
-    if tpeak_img is not None:
-        nib.save(tpeak_img, str(out_dir / fn_tpeak)); outputs["tpeak"] = out_dir / fn_tpeak
+    outputs = _save_output_images(
+        out_dir, prefix, tia_img, r2_img, sig_img, model_img, status_img, tpeak_img
+    )
     timing_ms["save_ms"] = 1000.0 * (_time.perf_counter() - t0)
 
     # Summary
-    status_counts = {int(k): int(v) for k, v in zip(*np.unique(status_vol[idx], return_counts=True))}
-    summary = {
-        "pytia_version": "0.1.0",
-        "times_seconds": [float(x) for x in t_s.tolist()],
-        "voxel_volume_ml": float(vml),
-        "status_legend": STATUS_LEGEND,
-        "status_counts": {STATUS_LEGEND[int(k)]: int(v) for k, v in status_counts.items()},
-        "timing_ms": timing_ms if (enable_prof or True) else {},  # keep timings; toggle later if desired
-        "config": cfg,
-    }
+    summary = _build_summary(
+        cfg=cfg,
+        t_s=t_s,
+        vml=float(vml),
+        model_vol=model_vol,
+        status_vol=status_vol,
+        idx=idx,
+        timing_ms=timing_ms,
+        enable_prof=enable_prof,
+    )
     if io_cfg.get("write_summary_yaml", True):
         outputs["summary"] = _save_summary(out_dir, prefix, summary)
 

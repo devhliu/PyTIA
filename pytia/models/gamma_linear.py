@@ -1,3 +1,5 @@
+"""Linearized gamma-function model for hump-shaped time-activity curves."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -24,7 +26,6 @@ def fit_gamma_linear_wls(
     t = times.astype(np.float64)
     if np.any(t <= 0):
         raise ValueError("Gamma linear fit requires times > 0.")
-    x0 = np.ones((T,), dtype=np.float64)
     x1 = np.log(t)
     x2 = -t
 
@@ -32,7 +33,8 @@ def fit_gamma_linear_wls(
     valid2 = valid & (A > 0)
     w = valid2.astype(np.float64)
 
-    y = np.where(valid2, np.log(A), 0.0).astype(np.float64)
+    y = np.zeros((N, T), dtype=np.float64)
+    y[valid2] = np.log(A[valid2])
 
     # Precompute sums for each voxel: Σ w * f
     Sw = np.sum(w, axis=1)
@@ -69,14 +71,23 @@ def fit_gamma_linear_wls(
 
     params = np.full((N, 3), np.nan, dtype=np.float64)
 
-    # Solve batched 3x3; skip ill-conditioned
-    # Condition proxy: det != 0 and enough points
+    # Solve batched 3x3 for well-conditioned rows.
     enough = Sw >= 3
-    det = np.linalg.det(G[enough])
     ok = np.zeros((N,), dtype=bool)
-    ok[enough] = np.isfinite(det) & (np.abs(det) > 1e-12)
+    if np.any(enough):
+        cond = np.linalg.cond(G[enough])
+        ok[enough] = np.isfinite(cond) & (cond < 1e12)
     if np.any(ok):
-        params[ok] = np.linalg.solve(G[ok], b[ok])
+        try:
+            params[ok] = np.linalg.solve(G[ok], b[ok][..., None])[..., 0]
+        except np.linalg.LinAlgError:
+            # Rare numerical fallback for near-singular systems.
+            ok_idx = np.flatnonzero(ok)
+            for i in ok_idx:
+                try:
+                    params[i] = np.linalg.lstsq(G[i], b[i], rcond=None)[0]
+                except np.linalg.LinAlgError:
+                    continue
 
     lnK = params[:, 0]
     alpha = params[:, 1]
@@ -87,11 +98,17 @@ def fit_gamma_linear_wls(
 
     # Build predictions
     K = np.exp(lnK)
-    Ahat = (K[:, None] * (t[None, :] ** alpha[:, None]) * np.exp(-beta[:, None] * t[None, :])).astype(
-        np.float64
-    )
+    Ahat = (
+        K[:, None] * (t[None, :] ** alpha[:, None]) * np.exp(-beta[:, None] * t[None, :])
+    ).astype(np.float64)
     # invalid if alpha<=0 or beta<=0 or K not finite
-    bad = (~np.isfinite(K)) | (~np.isfinite(alpha)) | (~np.isfinite(beta)) | (alpha <= 0) | (beta <= 0)
+    bad = (
+        (~np.isfinite(K))
+        | (~np.isfinite(alpha))
+        | (~np.isfinite(beta))
+        | (alpha <= 0)
+        | (beta <= 0)
+    )
     Ahat[bad, :] = np.nan
 
     tpeak = np.full((N,), np.nan, dtype=np.float64)

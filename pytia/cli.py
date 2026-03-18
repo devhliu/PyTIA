@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 from pathlib import Path
 
 import yaml
 
 from .config import Config
 from .engine import run_tia
+from .version import __version__
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -26,25 +28,30 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"ERROR: Failed to load config: {e}")
         return 1
 
+    try:
+        Config.load(cfg)
+    except Exception as e:
+        print(f"ERROR: Invalid config: {e}")
+        return 1
+
     inp = cfg.get("inputs", {})
     images = inp.get("images")
     times = inp.get("times")
-    mask = inp.get("mask")
+    mask_path = inp.get("mask")
 
     if not images or times is None:
         print("ERROR: Config must contain 'inputs.images' and 'inputs.times'")
         return 1
 
     try:
-        print(f"Running TIA estimation...")
-        result = run_tia(images=images, times=times, config=cfg, mask=mask)
+        print("Running TIA estimation...")
+        result = run_tia(images=images, times=times, config=cfg, mask=mask_path)
         print("✓ Complete!")
         for key, path in result.output_paths.items():
             print(f"  {key}: {path}")
         return 0
     except Exception as e:
         print(f"ERROR: {e}")
-        import traceback
         traceback.print_exc()
         return 1
 
@@ -89,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="pytia",
         description="PyTIA: Time-Integrated Activity from PET/SPECT",
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
 
     subparsers = parser.add_subparsers(dest="cmd", required=True)
 
@@ -104,8 +112,11 @@ def main(argv: list[str] | None = None) -> int:
     info_p.add_argument("--config", required=True, type=Path, help="YAML config file")
     info_p.set_defaults(func=cmd_info)
 
-    args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as e:
+        return int(e.code)
+    return int(args.func(args))
 
 
 if __name__ == "__main__":

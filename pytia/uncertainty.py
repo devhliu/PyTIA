@@ -1,3 +1,5 @@
+"""Residual bootstrap resampling for uncertainty quantification."""
+
 from __future__ import annotations
 
 import numpy as np
